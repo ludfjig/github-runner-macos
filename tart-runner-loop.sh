@@ -174,8 +174,10 @@ run_one_job() {
     run_failed=0
     fail_reason=""
 
-    log "[runner ${INDEX}] Cloning ${TART_GOLDEN_IMAGE} -> ${CLONE_NAME}"
-    tart clone "$TART_GOLDEN_IMAGE" "$CLONE_NAME"
+    local source_image
+    source_image="$(current_runner_image)" || return 1
+    log "[runner ${INDEX}] Cloning ${source_image} -> ${CLONE_NAME}"
+    tart clone "$source_image" "$CLONE_NAME" || return 1
 
     # Ensure the per-runner host cache dir exists before sharing it in.
     # Non-fatal: caching is an optimization, never a reason to fail a job.

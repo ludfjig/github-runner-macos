@@ -50,6 +50,16 @@ TART_GUEST_DISK_GB="${TART_GUEST_DISK_GB:-50}"
 # Where the GitHub Actions runner is installed inside the guest.
 TART_GUEST_RUNNER_DIR="${TART_GUEST_RUNNER_DIR:-/opt/actions-runner}"
 
+current_runner_image() {
+    local image_file="${TART_CONFIG_DIR}/images/${TART_GOLDEN_IMAGE}.current"
+    local image="$TART_GOLDEN_IMAGE"
+    if [ -f "$image_file" ]; then
+        IFS= read -r image < "$image_file" || return 1
+    fi
+    [[ "$image" =~ ^[a-zA-Z0-9._-]+$ ]] || return 1
+    printf '%s\n' "$image"
+}
+
 # Persistent host-side build cache, shared into each ephemeral guest over
 # virtio-fs. The throwaway clones are destroyed after every job, but this
 # directory lives on the host, so compiler/dependency caches (e.g. sccache)

@@ -26,6 +26,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CUSTOM_SSH_KEY="${TART_SSH_KEY:-}"
 # shellcheck source=tart-common.sh
 source "$SCRIPT_DIR/tart-common.sh"
 
@@ -55,6 +56,9 @@ Optional:
   --name-prefix <prefix>   Runner name prefix. Default: tart-ubuntu.
   --rebuild-image          Force a rebuild of the golden image even if it exists.
   --install-launchd        Install/reload a launchd service per runner.
+                          Also installs a daily runner-image refresh job.
+  --no-image-refresh      Do not install the refresh job (remove an existing
+                          refresh service separately when pinning a version).
     --launchd-scope <scope>  launchd scope: agent|daemon. Default: agent.
     --launchd-user <user>    User account for daemon scope. Default: current user.
     --launchd-dir <dir>      Directory for plist files.
@@ -75,6 +79,7 @@ NAME_PREFIX="tart-ubuntu"
 RUNNER_VERSION=""
 REBUILD_IMAGE=false
 INSTALL_LAUNCHD=false
+INSTALL_IMAGE_REFRESH=true
 LAUNCHD_LABEL_PREFIX="com.github.tart-runner"
 LAUNCHD_SCOPE="agent"
 LAUNCHD_USER="${SUDO_USER:-$USER}"
@@ -101,6 +106,7 @@ while [ "$#" -gt 0 ]; do
         --name-prefix) NAME_PREFIX="${2:-}"; shift 2 ;;
         --rebuild-image) REBUILD_IMAGE=true; shift ;;
         --install-launchd) INSTALL_LAUNCHD=true; shift ;;
+        --no-image-refresh) INSTALL_IMAGE_REFRESH=false; shift ;;
         --launchd-scope) LAUNCHD_SCOPE="${2:-}"; shift 2 ;;
         --launchd-user) LAUNCHD_USER="${2:-}"; shift 2 ;;
         --launchd-dir) LAUNCHD_DIR="${2:-}"; shift 2 ;;
@@ -154,6 +160,15 @@ resolve_launchd_layout() {
 
 resolve_launchd_layout
 
+CONFIG_DIR_VALUE="${TART_RUNNER_CONFIG_DIR:-$RUNNER_HOME/.config/github-runner-tart}"
+TART_SSH_KEY="${CUSTOM_SSH_KEY:-$CONFIG_DIR_VALUE/id_ed25519}"
+export TART_RUNNER_CONFIG_DIR="$CONFIG_DIR_VALUE" TART_SSH_KEY
+[[ "$TART_GOLDEN_IMAGE" =~ ^[a-zA-Z0-9._-]+$ ]] || die "Unsafe golden image name."
+mkdir -p "$CONFIG_DIR_VALUE/images"
+if [ "$LAUNCHD_SCOPE" = "daemon" ]; then
+    chown "$LAUNCHD_USER" "$CONFIG_DIR_VALUE" "$CONFIG_DIR_VALUE/images"
+fi
+
 # Persistent host cache root shared into the guests. Resolve it now (honouring
 # an explicit TART_CACHE_DIR) so the value baked into each launchd plist matches
 # what the loop would compute, and pre-create it.
@@ -176,6 +191,9 @@ ensure_golden_image() {
     fi
 
     log "Baking golden image '$TART_GOLDEN_IMAGE'..."
+    BAKE_LOCK_DIR="${CONFIG_DIR_VALUE}/images/${TART_GOLDEN_IMAGE}.lock"
+    mkdir "$BAKE_LOCK_DIR" 2>/dev/null || die "An image refresh or bake is already locked: $BAKE_LOCK_DIR"
+    trap 'rmdir "$BAKE_LOCK_DIR"' EXIT
     local bake_args=(
         --golden-image "$TART_GOLDEN_IMAGE"
         --base-image "$TART_BASE_IMAGE"
@@ -186,7 +204,17 @@ ensure_golden_image() {
     [ -n "$TART_GUEST_MEMORY_MB" ] && bake_args+=(--memory-mb "$TART_GUEST_MEMORY_MB")
     [ -n "$TART_GUEST_DISK_GB" ] && bake_args+=(--disk-gb "$TART_GUEST_DISK_GB")
 
-    bash "$SCRIPT_DIR/tart-bake-ubuntu.sh" "${bake_args[@]}"
+    if [ "$LAUNCHD_SCOPE" = "daemon" ]; then
+        sudo -H -u "$LAUNCHD_USER" env \
+            "TART_RUNNER_CONFIG_DIR=$CONFIG_DIR_VALUE" "TART_SSH_KEY=$TART_SSH_KEY" \
+            "TART_GUEST_USER=$TART_GUEST_USER" "TART_GUEST_RUNNER_DIR=$TART_GUEST_RUNNER_DIR" \
+            bash "$SCRIPT_DIR/tart-bake-ubuntu.sh" "${bake_args[@]}"
+    else
+        bash "$SCRIPT_DIR/tart-bake-ubuntu.sh" "${bake_args[@]}"
+    fi
+    rm -f "${CONFIG_DIR_VALUE}/images/${TART_GOLDEN_IMAGE}.current"
+    rmdir "$BAKE_LOCK_DIR"
+    trap - EXIT
 }
 
 # ---- launchd service per runner --------------------------------------------
@@ -272,6 +300,14 @@ ${user_block}
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HOME</key>
         <string>${RUNNER_HOME}</string>
+        <key>TART_RUNNER_CONFIG_DIR</key>
+        <string>${CONFIG_DIR_VALUE}</string>
+        <key>TART_SSH_KEY</key>
+        <string>${TART_SSH_KEY}</string>
+        <key>TART_GUEST_USER</key>
+        <string>${TART_GUEST_USER}</string>
+        <key>TART_GUEST_RUNNER_DIR</key>
+        <string>${TART_GUEST_RUNNER_DIR}</string>
         <key>TART_RUNNER_DEBUG</key>
         <string>${RUNNER_DEBUG_MODE}</string>
         <key>TART_KEEP_FAILED_VM</key>
@@ -301,6 +337,14 @@ EOF
     log "launchd service ready: $label"
 }
 
+install_image_refresh_service() {
+    TART_GUEST_USER="$TART_GUEST_USER" TART_GUEST_RUNNER_DIR="$TART_GUEST_RUNNER_DIR" \
+        bash "$SCRIPT_DIR/tart-install-image-updater.sh" \
+            --golden-image "$TART_GOLDEN_IMAGE" --launchd-scope "$LAUNCHD_SCOPE" \
+            --launchd-user "$LAUNCHD_USER" --launchd-dir "$LAUNCHD_DIR" \
+            --launchd-label-prefix "$LAUNCHD_LABEL_PREFIX"
+}
+
 # ---- Main -------------------------------------------------------------------
 if [ -n "$REPO" ]; then
     log "Target: repository $REPO"
@@ -321,6 +365,9 @@ for i in $(seq 1 "$COUNT"); do
         install_launchd_service "$i"
     fi
 done
+if [ "$INSTALL_LAUNCHD" = true ] && [ "$INSTALL_IMAGE_REFRESH" = true ]; then
+    install_image_refresh_service
+fi
 echo ""
 log "Provisioning complete."
 if [ "$INSTALL_LAUNCHD" = true ]; then

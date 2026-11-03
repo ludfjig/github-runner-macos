@@ -1,25 +1,18 @@
 # macOS GitHub Actions Runner Setup
 
-This repo automates GitHub Actions runner setup on macOS (Apple Silicon). It supports **two types** of runner that can run side by side. The key difference is the **capability** each one offers a job — what it can do, and whether it is isolated from the host. Both clean up after every job:
+These scripts install GitHub Actions runners on Apple Silicon Macs. You can run
+both types on the same Mac:
 
-1. **macOS / AVF runners** — jobs run on macOS itself, which exposes Apple's **Virtualization.framework (AVF)** to the job. Jobs are **not isolated from the host**: although we wipe each runner's `_work` directory after every job, anything a job writes outside `_work` (Homebrew packages, global caches, `/tmp`, login items, keychains, etc.) persists and is visible to later jobs and to the machine.
-2. **Ubuntu / KVM runners** — jobs run inside a throwaway Ubuntu 24.04 VM (via [Tart](https://tart.run)) which exposes **nested KVM** to the job. The VM is destroyed after a single job, so every job gets a clean environment that is **fully isolated from the host**, and workloads that need `/dev/kvm` (e.g. nested virtualization) just work. See [Ubuntu / KVM Runners](#ubuntu--kvm-runners).
+1. **macOS / AVF runners:** jobs run directly on the Mac and can use Apple's
+  Virtualization.framework (AVF). Only the runner's `_work` directory is cleared
+  after each job. Changes elsewhere on the Mac remain and can affect later jobs.
+2. **Ubuntu / KVM runners:** each job runs in a fresh Ubuntu VM with KVM support.
+  The VM is deleted after the job. A writable build cache on the Mac is shared
+  with later jobs on the same runner. See [Ubuntu / KVM Runners](#ubuntu--kvm-runners).
 
-> **Why two types? AVF vs KVM.** What we'd *ideally* want is isolated guest
-> VMs for both worlds: a **macOS guest exposing AVF** and a **Linux guest
-> exposing KVM**, so every job is sandboxed regardless of which virtualization
-> stack it needs. We can't have that — because Apple only exposes the hardware
-> virtualization extensions to **Linux** guests (nested virt is M3/M4 + macOS
-> 15+, **Linux guests only**). A virtualized **macOS** guest gets *no* virt
-> extensions, so it can't expose AVF. There's no isolated-VM option for the
-> AVF/macOS side, so we have to **compromise there**:
->
-> - **AVF (macOS):** since AVF can't be exposed inside a guest, the job runs on
->   the **macOS host** → **macOS / AVF runners**, with **no host
->   isolation.** (This is the compromise.)
-> - **KVM (Linux):** the job runs inside an isolated Linux VM that *is* handed
->   hardware virtualization → **Ubuntu / KVM runners** (arm64 Linux guests
->   only), **fully isolated from the host**.
+The macOS jobs cannot use the same VM isolation: Apple does not expose AVF
+inside a macOS VM. Linux VMs can use nested virtualization on the supported Macs
+listed below, which lets jobs run their own KVM guests.
 
 ## Requirements
 
@@ -27,52 +20,52 @@ This repo automates GitHub Actions runner setup on macOS (Apple Silicon). It sup
   not supported.
 - **macOS:** the macOS / AVF runners run on any reasonably current macOS. The
   Ubuntu / KVM runners need **macOS 15 (Sequoia)+ on M3/M4** — see that
-  section's [Requirements](#requirements).
+  section's [requirements](#tart-requirements).
 - The Mac must reach GitHub over outbound HTTPS on port 443.
 
-Reference docs:
-- https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/adding-self-hosted-runners
-- https://docs.github.com/en/actions/reference/runners/self-hosted-runners
-- https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/removing-self-hosted-runners
+GitHub documentation:
+
+- [Add a self-hosted runner](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/adding-self-hosted-runners)
+- [About self-hosted runners](https://docs.github.com/en/actions/reference/runners/self-hosted-runners)
+- [Remove a self-hosted runner](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/removing-self-hosted-runners)
 
 ---
 
 # macOS / AVF Runners
 
-The GitHub Actions agent runs directly on macOS, so jobs get access to Apple's
-Virtualization.framework (AVF). These runners are **persistent** and **not
-isolated from the host** (see the trade-off note at the top).
+Jobs run directly on the Mac and can use Apple's Virtualization.framework (AVF).
+The setup script downloads the GitHub runner, registers it with your repository
+or organization, and installs services to keep it running.
 
-These runners:
-- download and extract the GitHub runner package
-- create numbered runner directories from a prefix
-- configure each runner against a repo or org
-- run them under launchd with restart behavior
-- give each runner a private `<runner-dir>/.home` directory by default, or optionally create a separate macOS user per runner
-- clean each runner work directory after every job (this clears `_work` only — it does **not** isolate jobs from the rest of the host)
+Each runner gets its own directory and home folder. You can also give each
+runner a [separate macOS account](#separate-users-per-runner). Neither option
+isolates jobs from the Mac; cleanup only removes the runner's `_work` directory.
 
 ## Scripts
 
-- `bootstrap-gh-runners.sh`: creates directories, downloads runner binaries, extracts, and runs `config.sh` in unattended mode.
-- `github-runner-wrapper.sh`: crash-recovery wrapper around `run.sh` (restart-on-crash, graceful SIGTERM, keeps the Mac awake).
-- `github-runner-cleanup.sh`: canonical post-job cleanup hook; copied into each runner directory and wired up via `ACTIONS_RUNNER_HOOK_JOB_COMPLETED` to wipe `_work` after every job.
-- launchd plists are generated automatically by bootstrap when using `--install-launchd`.
+- `bootstrap-gh-runners.sh`: downloads and registers the runners. With `--install-launchd`, it also creates their macOS service files (plists).
+- `github-runner-wrapper.sh`: keeps the Mac awake, restarts a crashed runner and handles requests to stop it.
+- `github-runner-cleanup.sh`: clears `_work` after each job. Setup copies it into each runner directory and enables it through `ACTIONS_RUNNER_HOOK_JOB_COMPLETED`.
 
-## 1) Get Setup Values from GitHub UI
+## 1. Get A Registration Token
 
 In your repository or organization:
+
 1. Go to Settings -> Actions -> Runners.
 2. Click New self-hosted runner.
 3. Select macOS and the correct architecture for your Mac.
-4. Copy the URL target and registration token shown by GitHub.
+4. Note the repository or organization and copy the registration token.
 
 Important:
+
 - Do not commit tokens to git.
 - If a token expires, generate a new one and rerun bootstrap.
 
-## 2) One Command: Bootstrap + Hook Env + launchd
+## 2. Install The macOS Runners
 
-Recommended (LaunchDaemon mode, starts at boot without login):
+Run this from the folder containing the scripts. Replace `your-org` and
+`YOUR_REGISTRATION_TOKEN` with your values. This installs three runners that
+start after reboot without anyone signing in (LaunchDaemon services):
 
 ```bash
 sudo bash bootstrap-gh-runners.sh \
@@ -86,7 +79,8 @@ sudo bash bootstrap-gh-runners.sh \
   --launchd-user "$USER"
 ```
 
-User based (LaunchAgent mode, starts after user login):
+Alternatively, to run only while your account is signed in, use LaunchAgent
+services. This example registers runners for a repository:
 
 ```bash
 bash bootstrap-gh-runners.sh \
@@ -100,39 +94,43 @@ bash bootstrap-gh-runners.sh \
 ```
 
 What this creates:
-- $HOME/github-runner-1
-- $HOME/github-runner-2
-- $HOME/github-runner-3
 
-Each launchd service sets `HOME` to its runner's `.home` directory (for example,
-`$HOME/github-runner-1/.home`). This prevents concurrent runners from racing on
-shared user-level state such as `~/.rustup`. Host-level state including Homebrew,
-`/tmp`, keychains, and system services remains shared.
+- `$HOME/github-runner-1`
+- `$HOME/github-runner-2`
+- `$HOME/github-runner-3`
 
-Common flags:
-- --labels <csv>: Custom labels (default: `hvf`). Passing this flag replaces the default. GitHub automatically adds `self-hosted`, `macOS`, and `ARM64`; do not repeat them here.
-- --runner-group <name>: Org or enterprise runner group.
-- --name-prefix <prefix>: Base name for runners.
-- --runner-user-prefix <prefix>: Create a separate non-admin macOS account for each runner. See [Separate users per runner](#separate-users-per-runner).
-- --token-file <path>: Read the registration token from a file instead of `--token` (keeps the secret out of shell history and the process list).
-- --replace: Reconfigure existing runners in place. The script stops any running launchd job first, deregisters the stale local config, then re-registers (passing `--replace` to `config.sh` so a same-named server-side runner is replaced).
-- --force-recreate: Stops the launchd job, deletes existing directories, and reinstalls from scratch. Implies `--replace` at registration time so the same-named server-side runner is replaced rather than rejected.
-- --install-launchd: Installs/reloads launchd services for all runners 1..N.
-- --uninstall-launchd: Stops and removes launchd services for runners 1..N, then exits. No token or target is required. Run with `sudo` to also remove system daemon plists in `/Library/LaunchDaemons`.
-- --launchd-scope <agent|daemon>: launchd domain (`agent` requires login, `daemon` starts at boot).
-- --launchd-user <user>: account used by daemon mode (`UserName` in plist).
-- --launchd-dir <dir>: launchd plist directory override.
-- --launchd-label-prefix <prefix>: Custom launchd label prefix (default: com.github.runner).
-- --launch-agents-dir <dir>: Back-compat alias for `--launchd-dir`.
-- --version x.y.z: Pins runner version instead of latest.
+Each service sets `HOME` to its runner's `.home` directory (for example,
+`$HOME/github-runner-1/.home`). This keeps tools such as rustup from writing to
+the same home folder at once. Homebrew, `/tmp`, keychains and system services
+are still shared.
 
-Incremental behavior:
-- If prefix-1 and prefix-2 already exist and are configured, and you run with --count 3, the script skips existing configured directories and ensures services 1..3 are installed/reloaded.
-- It also ensures ACTIONS_RUNNER_HOOK_JOB_COMPLETED is present in each runner .env and writes job-completed-hook.sh.
+Common options:
+
+- `--labels <csv>`: comma-separated custom labels (default `hvf`). Replaces the default custom labels, but not GitHub's automatic `self-hosted`, `macOS` and `ARM64` labels.
+- `--runner-group <name>`: organization or enterprise runner group.
+- `--name-prefix <prefix>`: prefix for runner names in GitHub.
+- `--runner-user-prefix <prefix>`: create a separate non-admin macOS account for each runner. See [Separate users per runner](#separate-users-per-runner).
+- `--token-file <path>`: read the registration token from a file instead of `--token`, keeping it out of shell history and the process list.
+- `--replace`: stop and re-register existing runners without reinstalling their files. Replaces a runner with the same name in GitHub.
+- `--force-recreate`: stop existing runners, delete their directories and reinstall. Also replaces runners with the same names in GitHub.
+- `--install-launchd`: install or reload services for the requested runner count.
+- `--uninstall-launchd`: stop and remove services for the requested runner count, then exit. No token, repository or organization is needed. Use `sudo` to also remove boot-time services.
+- `--launchd-scope <agent|daemon>`: `agent` starts at sign-in; `daemon` starts at boot.
+- `--launchd-user <user>`: account that runs boot-time services.
+- `--launchd-dir <dir>`: folder for service files.
+- `--launchd-label-prefix <prefix>`: prefix for service names (default `com.github.runner`).
+- `--launch-agents-dir <dir>`: older name for `--launchd-dir`.
+- `--version x.y.z`: version to download for a new installation. Existing runner files are reused, and the runner can still update itself.
+
+Rerunning setup reuses configured runner directories unless you request
+`--replace` or `--force-recreate`. For example, increasing `--count` from 2 to 3
+adds the third runner. With `--install-launchd`, services for all three runners
+are installed or reloaded, which can interrupt jobs. Setup also installs the
+cleanup hook in each directory.
 
 ### Separate users per runner
 
-Opt in with `--runner-user-prefix`. Bootstrap creates the accounts and starts
+Use `--runner-user-prefix` to create separate accounts. Setup starts
 each runner automatically after reboot under its own user. No login is needed.
 Run this from an administrator account:
 
@@ -155,10 +153,10 @@ This creates `gha-macos-1` through `gha-macos-3`. Each account has:
   The accounts are hidden from the login screen.
 - Its own boot-time service, running as that account, **not root**.
 
-Registration, extraction and runner-file updates run as the account too.
+Runner registration, installation and file updates run as that account too.
 Shared service scripts are installed under the root-owned
 `/Library/Application Support/github-runner-macos` directory, so the accounts
-do not need access to the bootstrap checkout.
+do not need access to the folder containing these scripts.
 
 Do not combine this option with `--dir-prefix` or `--launchd-user`. Use the
 standard service directory; custom `--launchd-dir` values are not supported in
@@ -166,11 +164,11 @@ this mode. Account names must start with a lowercase letter, contain only
 lowercase letters, digits, `_` or `-`, and fit within 31 characters including
 the `-N` suffix.
 
-Rerunning bootstrap reuses accounts it created and checks their ownership and
+Rerunning setup reuses accounts it created and checks their ownership and
 account settings. It refuses unrelated accounts or pre-existing homes rather
 than taking them over. If account creation fails partway through, inspect the
 partial account and home before retrying; bootstrap does not delete them.
-Do not run two account-provisioning bootstraps concurrently.
+Do not run two copies of the account setup at the same time.
 
 **Switching existing runners:** follow the
 [step-by-step migration guide](MIGRATE-TO-PER-USER-RUNNERS.md). It covers getting
@@ -180,9 +178,9 @@ the new setup.
 Install shared tools as an administrator and leave them read-only to runner
 accounts. Keep writable caches and credentials per account. These accounts have
 no automatic sudo access; existing host sudo policies must not grant it.
-Workloads requiring a desktop session, an unlocked login keychain, or privacy
-permissions may need additional setup. Qualify your AVF workloads under the
-new accounts before switching the fleet.
+Jobs requiring a desktop session, an unlocked login keychain or macOS privacy
+permissions may need additional setup. Run your AVF workflows under the new
+accounts and check they succeed before replacing the old runners.
 
 Separate users reduce cross-runner access and interference; they are **not a
 sandbox**. System-wide resources remain shared, and state outside `_work`
@@ -204,7 +202,7 @@ Remove runner registrations from GitHub separately.
 Bootstrap regression tests use mocked macOS commands and do not create real
 accounts or services: `bash tests/bootstrap-gh-runners.test.sh`.
 
-## 3) Verify
+## 3. Check The macOS Runners
 
 LaunchDaemon mode:
 
@@ -225,10 +223,11 @@ launchctl list com.github.runner-3
 ```
 
 Expected in runner terminal/logs after startup:
+
 - Connected to GitHub
 - Listening for Jobs
 
-## OPS (macOS / AVF runners)
+## Manage macOS Runners
 
 LaunchDaemon mode:
 
@@ -290,75 +289,85 @@ done
 ```
 
 Notes:
-- LaunchDaemon mode is resilient to reboot without login.
-- LaunchAgent mode requires user login after reboot.
-- The wrapper includes a failure circuit breaker to avoid tight crash loops:
-  default threshold=5 failures in 600s, cooldown=180s, then automatic resume.
-- Tune via launchd environment variables:
+
+- LaunchDaemon services start after reboot without anyone signing in.
+- LaunchAgent services start when their user signs in.
+- After five failures within ten minutes, the wrapper waits three minutes before
+  retrying. This prevents constant restarts when a runner is broken.
+- These service environment variables control the retry limits:
   `GH_WRAPPER_FAILURE_THRESHOLD`, `GH_WRAPPER_FAILURE_WINDOW_SEC`,
   `GH_WRAPPER_FAILURE_COOLDOWN_SEC`.
 
-Remove runner registration from GitHub:
-- Use the Remove flow in GitHub Settings -> Actions -> Runners for each runner.
-- If you still have machine access, use the remove command GitHub provides in that UI.
+To remove a runner's GitHub registration, open **Settings -> Actions -> Runners**
+in GitHub and select the runner's removal option. If you still have access to
+the Mac, follow the removal command GitHub displays.
 
 ---
 
 # Ubuntu / KVM Runners
 
-These runners run every CI job inside a **single-use Ubuntu 24.04 VM** managed by
-[Tart](https://tart.run). When a job finishes, the VM is destroyed and the next
-job gets a fresh clone of a golden image. Because the guests boot with nested
-virtualization enabled, `/dev/kvm` is available inside the job — ideal for
-workloads that themselves spin up VMs.
+Each job runs in a fresh Ubuntu 24.04 VM managed by [Tart](https://tart.run).
+The VM is copied from a prepared image (called the golden image) and deleted
+after the job. Nested virtualization gives the job access to `/dev/kvm`, so it
+can run its own ARM64 VMs.
 
-These runners are **additive**: they register as separate runners and coexist
-with the macOS / AVF runners above.
+These register as separate runners. You can use them alongside the macOS runners.
 
 ## Scripts
 
-- `bootstrap-tart-runners.sh`: bakes the golden image (if needed) and installs one launchd service per runner.
-- `tart-bake-ubuntu.sh`: builds the golden Ubuntu 24.04 image with the runner + KVM pre-installed.
-- `tart-runner-loop.sh`: endless single-use ephemeral runner loop (clone → run one job → destroy).
-- `tart-github-app-token.sh`: mints short-lived runner registration tokens from a GitHub App.
+- `bootstrap-tart-runners.sh`: prepares the image if needed; with `--install-launchd`, installs runner services and the daily image updater.
+- `tart-install-image-updater.sh`: installs daily image updates without changing runner services.
+- `tart-update-image.sh`: updates Ubuntu packages and the GitHub runner in a verified image clone.
+- `tart-bake-ubuntu.sh`: prepares the Ubuntu 24.04 image with the runner and KVM support.
+- `tart-runner-loop.sh`: repeatedly creates a VM, runs one job and deletes the VM.
+- `tart-github-app-token.sh`: gets short-lived runner registration tokens using a GitHub App.
 - `tart-common.sh`: shared helpers/defaults sourced by the above (not run directly).
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    A[Golden image\ngha-ubuntu-kvm] -->|clone| B[Ephemeral VM]
+  G[Original Ubuntu image] --> A[Image used for new jobs]
+  U[Daily package and runner update] -->|use updated image if checks pass| A
+  A -->|clone| B[Ephemeral VM]
     B -->|tart run --nested| C[Boot Ubuntu 24.04]
-    C -->|mint token via GitHub App| D[config.sh --ephemeral]
+    C -->|get token using GitHub App| D[config.sh --ephemeral]
     D -->|run.sh| E[Run ONE job]
     E -->|tart stop + delete| F[Destroy VM]
     F -->|loop| A
 ```
 
-One `tart-runner-loop.sh` process == one concurrent runner. `bootstrap-tart-runners.sh`
-launches N of them under launchd.
+Each runner process handles one job at a time. Setup installs one service per
+runner, so `--count 3` lets three jobs run at once.
 
-## Requirements
+## Tart Requirements
 
 - **Hardware/OS:** Apple Silicon **M3 or M4** running **macOS 15 (Sequoia) or
-  later**. Nested virtualization is gated to this combination and to **Linux
-  guests only** — see the [Tart FAQ](https://tart.run/faq/#nested-virtualization-support).
-  The inner KVM is arm64-only (no x86 guests).
-- **Host tooling:** [`tart`](https://tart.run), `curl`, `openssl`, `jq`,
-  `sshpass` (used once during the bake), and `ssh`/`ssh-keygen`.
+  later**. Nested virtualization requires this combination and works only in
+  **Linux guests**. See the [Tart FAQ](https://tart.run/faq/#nested-virtualization-support).
+  KVM can run ARM64 guests, not x86 guests.
+- **Tools on the Mac:** [`tart`](https://tart.run), `curl`, `openssl`, `jq`,
+  `sshpass` (used during image setup), and `ssh`/`ssh-keygen`.
 
   ```bash
   brew install cirruslabs/cli/tart jq
   brew install hudochenkov/sshpass/sshpass   # or any sshpass formula
   ```
 
-- A **GitHub App** for token minting (see below). We deliberately avoid
-  long-lived PATs and never store a registration token on disk.
+- A **GitHub App** to register runners (see below). No personal access token is
+  needed, and registration tokens are not saved to disk.
 
-## 1) Create the GitHub App
+## First Install
 
-The runners authenticate as a GitHub App. The host holds only the App's private
-key; each VM boot mints a fresh, short-lived registration token.
+Run commands from the folder containing these scripts on the Mac. Do not move
+that folder after setup: the services run scripts from that location. To update
+an existing installation, use
+[Update Ubuntu Packages And GitHub Runner](#update-ubuntu-packages-and-github-runner), not repeat bootstrap.
+
+### 1. Create the GitHub App
+
+The Mac uses a GitHub App's private key to get a short-lived registration token
+whenever it starts a runner. The private key stays on the Mac.
 
 1. Go to **GitHub → Settings**:
    - For a **repository/personal** target: your user **Settings → Developer
@@ -387,32 +396,28 @@ key; each VM boot mints a fresh, short-lived registration token.
 You now have an **App ID** and a **private key `.pem`** — that's all the host
 needs.
 
-## 2) Bake the golden image (first run, ~once)
+### 2. Prepare the patched kernel packages
 
-`bootstrap-tart-runners.sh` does this automatically on first run, but you can do
-it explicitly:
+Creating the image requires patched kernel and header packages matching
+`debs/linux*7.0.0-28*vmid5*.deb`. Setup does not download or build them for you.
+
+The [kernel build helper](tart-build-kernel.sh) builds patched packages in a
+separate `kernel-builder` VM and writes them to `./debs`:
 
 ```bash
-bash tart-bake-ubuntu.sh
-# options: --golden-image <name> --base-image <ref> --runner-version <x.y.z>
-#          --cpus <n> --memory-mb <mb> --disk-gb <gb> --force
+bash tart-build-kernel.sh
+find ./debs -maxdepth 1 -name 'linux*7.0.0-28*vmid5*.deb' -print
 ```
 
-This:
-- generates a dedicated SSH keypair at `~/.config/github-runner-tart/id_ed25519`
-  (reused on subsequent bakes),
-- clones `ghcr.io/cirruslabs/ubuntu:latest` (Ubuntu 24.04) into `gha-ubuntu-kvm`,
-- boots it with `--nested`, injects the key, installs the Actions runner and its
-  dependencies, **verifies `/dev/kvm` with `kvm-ok`** (the bake fails if nested
-  KVM is unavailable), then disables password SSH and shuts down.
+**Known setup problem:** the image setup script requires patched kernel `7.0.0-28`, but the build
+helper may build a different version. If the command above lists no matching
+packages, first-time setup will fail. The scripts need to agree on the kernel
+version. Routine updates to an existing image do not need these packages.
 
-> Note: the cirruslabs base image ships with well-known `admin`/`admin`
-> credentials. They are used **only once** during the bake to inject our key;
-> password authentication is then turned off inside the golden image.
+### 3. Install The Ubuntu Runners
 
-## 3) One command: bootstrap + launchd (LaunchDaemon recommended)
-
-Recommended (system LaunchDaemons, survives reboot without login):
+Replace the organization, App ID and private-key path with your values. This
+installs three runners that start after reboot without anyone signing in:
 
 ```bash
 sudo bash bootstrap-tart-runners.sh \
@@ -428,29 +433,162 @@ sudo bash bootstrap-tart-runners.sh \
   --launchd-user "$USER"
 ```
 
-Interactive-user mode (LaunchAgents; starts after user login):
+For a repository, replace `--org your-org` with `--repo owner/repo`.
 
-Repository target:
+Setup reuses an existing image. On a fresh install it creates `gha-ubuntu-kvm`,
+installs the runner, LLVM/Clang 18 tools, QEMU, build-essential and the local
+patched kernel. It generates a dedicated SSH key under
+`~/.config/github-runner-tart/` and disables password SSH after initial access
+with the base image's `admin`/`admin` credentials. Setup checks KVM **before**
+installing the patched kernel; it does not validate that kernel after reboot.
+Confirm a real workflow succeeds using [Check Ubuntu Runners](#check-ubuntu-runners).
+
+With `--install-launchd`, setup also installs the daily image updater.
+Use `--no-image-refresh` to skip installing it; this does not disable an updater
+that is already installed.
+
+To rebuild an existing image, rerun your bootstrap command with `--rebuild-image`.
+Wait until jobs finish first: bootstrap can restart runner services and interrupt
+jobs. Do not replace the image by running the bake script directly; runners may
+keep using the previous image.
+
+## Update Ubuntu Packages And GitHub Runner
+
+Run as the account that owns the Tart VMs, **without sudo**. No bootstrap,
+GitHub App credentials, full rebake or local kernel packages are needed:
 
 ```bash
-bash bootstrap-tart-runners.sh \
-  --count 2 \
-  --repo owner/repo \
-  --app-id 123456 \
-  --private-key "$HOME/.config/github-runner-tart/app.private-key.pem" \
-  --install-launchd
+bash tart-update-image.sh
 ```
 
-Organization target:
+The updater copies the current image, upgrades its Ubuntu packages using APT,
+and installs the latest GitHub runner if needed. It verifies the runner download
+against its published checksum. Package updates are checked even if the runner
+is already current.
+
+Before using a changed image for new jobs, it reboots the VM and checks the runner
+version, KVM support and that the kernel has not changed. If a check fails, jobs
+keep using the previous image. If nothing changed, the extra copy is deleted.
+These checks do not replace running a real workflow.
+
+Running jobs are not affected. The Mac needs enough memory and disk for one extra
+VM during the update. Old images stay on disk until you delete them.
+
+You still need to handle these separately:
+
+- **Kernel updates, including security fixes:** the updater keeps the patched kernel unchanged.
+- **Changing Ubuntu or LLVM versions:** it does not upgrade Ubuntu to another release or replace LLVM 18 with a newer major version.
+- **Mac software and manually installed guest tools:** it does not update macOS, Homebrew, Tart or guest software installed without APT.
+- **Skipped packages:** packages marked "hold" are left alone. Updates that would remove another package are also skipped; check the logs for these.
+
+## Enable Daily Ubuntu Package And GitHub Runner Updates
+
+If your runners are already installed but you did not enable automatic updates,
+open Terminal on the Mac that runs the VMs. Sign in as the account that owns
+those VMs, then use `cd` to open the folder containing these scripts. Run:
 
 ```bash
-bash bootstrap-tart-runners.sh \
-  --count 4 \
-  --org your-org \
-  --app-id 123456 \
-  --private-key "$HOME/.config/github-runner-tart/app.private-key.pem" \
-  --install-launchd
+sudo bash tart-install-image-updater.sh --launchd-user "$USER"
 ```
+
+That is all you need to install the scheduled updater. **Do not rerun bootstrap.**
+No GitHub App credentials are needed, and runner services are not restarted.
+The updater runs immediately, then every 24 hours while the Mac is awake. It
+starts again after reboot without anyone signing in. It updates Ubuntu packages
+and the GitHub runner using the same checks as the manual update command above.
+
+If you previously installed the updater before the scripts were renamed, run
+the same command again to fix the saved script path. Its service label and log
+filenames still contain `image-refresh`.
+
+For older runners that do not yet support updated images, also
+[restart the runners once](#restart-runners), after their jobs finish.
+Their logs should then show `Cloning <selected-image> -> ...` using the image
+listed under [Check Whether Updates Worked](#check-whether-updates-worked).
+
+## Check Whether Updates Worked
+
+Run these commands on the Mac, signed in as the account that owns the VMs:
+
+```bash
+# Check the scheduled updater.
+sudo launchctl print system/com.github.tart-runner-image-refresh
+
+# Read the update logs.
+cat "$HOME/.github-runner-logs/tart-image-refresh-stdout.log"
+cat "$HOME/.github-runner-logs/tart-image-refresh-stderr.log"
+```
+
+Look for `Promoted updated guest packages and runner` or
+`guest packages are current; no image promoted` in the logs. Errors explain why
+an update failed. Normal package-install output also goes into the stderr log;
+text in that file does not by itself mean failure. There are no email or other
+failure notifications.
+
+To see which image new jobs will use:
+
+```bash
+image_file="$HOME/.config/github-runner-tart/images/gha-ubuntu-kvm.current"
+if [[ -f "$image_file" ]]; then
+  cat "$image_file"
+else
+  printf '%s\n' gha-ubuntu-kvm
+fi
+```
+
+Jobs already running keep their existing VM. Confirm a real workflow succeeds
+after an update; an installed service alone does not prove the runners work.
+
+## Undo An Image Update
+
+Use this only if an updated image causes problems.
+
+1. Stop automatic updates so they cannot immediately replace the older image:
+
+   ```bash
+   sudo launchctl bootout system/com.github.tart-runner-image-refresh
+   ```
+
+2. Prevent new jobs from starting, let current jobs finish, then
+   [stop the runners](#stop-runners).
+3. Run `tart list` to see the saved images. Choose one that worked before the
+   update. In the block below, set `rollback_image` to its name. The default
+   shown, `gha-ubuntu-kvm`, is the original image, not necessarily the most
+   recent working one.
+4. From the folder containing these scripts, run this as the account that owns
+   the VMs, without sudo:
+
+   ```bash
+   bash <<'ROLLBACK'
+   set -euo pipefail
+   source ./tart-common.sh
+   rollback_image="gha-ubuntu-kvm"
+   state_dir="$TART_CONFIG_DIR/images"
+   lock_dir="$state_dir/$TART_GOLDEN_IMAGE.lock"
+   tart get "$rollback_image" >/dev/null
+   mkdir "$lock_dir"
+   trap 'rm -f "$state_dir/$TART_GOLDEN_IMAGE.current.tmp"; rmdir "$lock_dir"' EXIT
+   printf '%s\n' "$rollback_image" > "$state_dir/$TART_GOLDEN_IMAGE.current.tmp"
+   mv "$state_dir/$TART_GOLDEN_IMAGE.current.tmp" "$state_dir/$TART_GOLDEN_IMAGE.current"
+   ROLLBACK
+   ```
+
+   If `mkdir` reports that the `.lock` folder already exists, stop. An image build
+   or update may still be running. Do not delete the lock while either is running.
+
+5. [Start the runners again](#restart-runners) and check that a workflow succeeds.
+   Keep automatic updates stopped until the problem is fixed. To enable them
+   again, rerun the daily-update installation command; this immediately starts
+   another update check.
+
+Old images are not deleted automatically. Once you have confirmed a replacement
+works, use `tart delete <image-name>` to remove images you no longer need.
+Keep the original image, the image chosen for new jobs, and any image still in
+use.
+
+## Reference
+
+### Workflow Labels
 
 The only custom label by default is `kvm`. GitHub automatically adds
 `self-hosted`, `Linux`, and `ARM64`; neither bootstrap disables these default
@@ -463,81 +601,69 @@ jobs:
     runs-on: [self-hosted, Linux, ARM64, kvm]
 ```
 
-GitHub matches **all labels requested by the job**, not the runner's full label
-set. Extra runner labels do not restrict which jobs it can accept: a job asking
-only for `self-hosted` or `Linux` can still match these runners. Omitting `ARM64`
-or `kvm` can also allow a job onto a runner without that architecture or
-capability. Labels are routing metadata, not an access-control boundary.
+GitHub chooses a runner that has **all the labels requested by the job**. Extra
+labels on a runner do not prevent it from accepting jobs: a job asking only for
+`self-hosted` or `Linux` can still run here. Include `ARM64` and `kvm` to require
+both ARM64 hardware and KVM support. Labels choose runners; they do not control
+who is allowed to use them.
 
 Do not add GitHub-hosted image labels such as `ubuntu-24.04` to these runners.
 A bare `runs-on: ubuntu-24.04` can otherwise match an ARM64 Tart runner instead
 of the intended GitHub-hosted x64 environment. The guest remains Ubuntu 24.04;
 removing that label does not change its OS or installed tools.
 
-Common flags:
-- `--count <N>`: number of concurrent ephemeral runners.
+### Runner Setup Options
+
+Common options for `bash bootstrap-tart-runners.sh` (run with `--help` for the full list):
+
+- `--count <N>`: maximum number of jobs that can run at once.
 - `--golden-image <name>`: golden image name (default `gha-ubuntu-kvm`).
-- `--base-image <ref>`: base OCI image (default `ghcr.io/cirruslabs/ubuntu:latest`).
-- `--runner-version <x.y.z>`: pin the Actions runner version baked in.
+- `--base-image <ref>`: Ubuntu image to start from (default `ghcr.io/cirruslabs/ubuntu:latest`).
+- `--runner-version <x.y.z>`: runner version to install when creating the image. Later image updates install the latest version, and the runner can also update itself.
 - `--cpus <n>`: set guest vCPU count in the baked image.
 - `--memory-mb <mb>`: set guest RAM in MB in the baked image.
 - `--disk-gb <gb>`: set guest disk size in GB in the baked image.
-- `--labels <csv>`: replace the custom label list (default `kvm`), not GitHub's automatic labels. Keep `kvm` when adding other custom labels for KVM jobs. `TART_RUNNER_LABELS` sets the environment default; the CLI flag takes precedence.
+- `--labels <csv>`: comma-separated custom labels (default `kvm`). Keep `kvm` when adding labels for KVM jobs. GitHub's automatic labels are unchanged. This option overrides `TART_RUNNER_LABELS` if set.
 - `--name-prefix <prefix>`: runner name prefix (default `tart-ubuntu`).
 - `--rebuild-image`: force a rebuild of the golden image.
-- `--install-launchd`: install/reload a launchd service per runner.
-- `--launchd-scope <agent|daemon>`: choose LaunchAgent (user login required) or LaunchDaemon (starts at boot).
-- `--launchd-user <user>`: account used by daemon scope (sets `UserName` in plist).
-- `--launchd-dir <dir>`: plist directory override.
-- `--launchd-label-prefix <p>`: launchd label prefix (default `com.github.tart-runner`).
+- `--install-launchd`: install or reload runner services and the daily image updater.
+- `--no-image-refresh`: skip installing the image updater; does not remove an existing updater.
+- `--launchd-scope <agent|daemon>`: `agent` starts at sign-in; `daemon` starts at boot.
+- `--launchd-user <user>`: account that runs boot-time services.
+- `--launchd-dir <dir>`: folder for service files.
+- `--launchd-label-prefix <p>`: prefix for service names (default `com.github.tart-runner`).
 
-Hardening defaults (in `tart-common.sh`):
-- SSH keepalive/fail-fast to avoid stuck loops after dead guests.
-- Automatic cleanup of stale host-side `tart run` processes.
-- Failure circuit breaker: if a runner sees repeated failures (default: 3 in 600s), it cools down for 180s, then resumes automatically.
+### Automatic Failure Recovery
 
-### Persistent build cache (virtio-fs)
+- SSH connections time out if a VM stops responding, rather than leaving the runner stuck.
+- The runner cleans up leftover `tart run` processes on the Mac.
+- After three failures within ten minutes, a runner waits three minutes before retrying.
 
-Each ephemeral guest is destroyed after one job, so without help every job
-rebuilds from scratch. To keep compiler/dependency caches warm, the runner loop
-shares a **persistent host directory into every guest over virtio-fs**:
+### Build Cache
 
-- Host side: `~/.cache/github-runner-tart/runner-<N>/` (override the root with
-  `TART_CACHE_DIR`). The bootstrap script pre-creates it and bakes the path into
-  each launchd plist. It is shared in via `tart run --dir=ci-cache:<path>`.
-- Guest side: Apple's Virtualization framework exposes every `--dir` share under
-  a single automount tag (`com.apple.virtio-fs.automount`), with each named
-  share as a sub-directory. The loop mounts that tag at `/var/cache/ci`, so the
-  cache lives at `/var/cache/ci/ci-cache/` (best-effort; a mount failure is
-  non-fatal and never fails the job). `SCCACHE_DIR=/var/cache/ci/ci-cache/sccache`
-  and `SCCACHE_CACHE_SIZE` are exported into the runner environment, so once a
-  workflow enables [sccache](https://github.com/mozilla/sccache) the cache is
-  automatically persistent and **network-free** — no GitHub cache upload/download.
+VMs are deleted after each job, but build caches can be reused. Each runner
+shares its own cache folder on the Mac with its VMs using virtio-fs:
 
-This is transparent to the workflow YAML: jobs just see a populated
-`SCCACHE_DIR`. It complements (does not replace) `Swatinem/rust-cache`; it
-deliberately only provides the sccache layer to avoid fighting that action over
-`CARGO_HOME`/`target`.
+- On the Mac: `~/.cache/github-runner-tart/runner-<N>/`.
+- Inside the VM: `/var/cache/ci/ci-cache/`. If the shared folder cannot be mounted,
+  the job still runs, but it cannot reuse that cache.
+- For [sccache](https://github.com/mozilla/sccache): the runner sets
+  `SCCACHE_DIR=/var/cache/ci/ci-cache/sccache` and `SCCACHE_CACHE_SIZE`. Your
+  workflow must still enable sccache. Cached files stay on the Mac; they are not
+  uploaded to GitHub's cache service.
 
-**Concurrency (multiple runners):** each runner index gets its **own** cache
-sub-directory (`runner-<N>`), so two runners never write to the same cache dir.
-This is intentional — sccache/cargo are not safe with multiple independent
-writers sharing one directory over virtio-fs, so per-runner dirs avoid cache
-corruption at the cost of a little disk and a lower cross-runner hit rate. Tune
-the cap with `TART_CACHE_MAX_SIZE` (default `20G`).
+This does not replace `Swatinem/rust-cache` or share `CARGO_HOME` and `target`
+directories. Each runner has its own cache folder, so simultaneous jobs on
+different runners do not write to the same cache. They also cannot reuse each
+other's cached files.
 
-## 4) Verify
+The default sccache size limit is `20G` per runner (`TART_CACHE_MAX_SIZE`).
+`TART_CACHE_DIR` changes the parent cache folder; rerun service installation to
+apply a changed path to the services.
 
-LaunchDaemon mode:
+## Check Ubuntu Runners
 
-```bash
-sudo launchctl print system/com.github.tart-runner-1
-sudo launchctl print system/com.github.tart-runner-2
-sudo launchctl print system/com.github.tart-runner-3
-tail -f ~/.github-runner-logs/tart-runner-1-stdout.log
-```
-
-Daemon ops cheat sheet:
+For services that start at boot (LaunchDaemons):
 
 ```bash
 # Status (all configured Tart runner daemons)
@@ -570,11 +696,13 @@ launchctl list com.github.tart-runner-1
 launchctl list com.github.tart-runner-2
 ```
 
-You should see clone → boot → "Listening for Jobs" → teardown on each cycle. In
-**GitHub → Settings → Actions → Runners** you'll see ephemeral runners appear
-for the duration of a job and disappear afterwards.
+You should see clone → boot → "Listening for Jobs", followed by teardown after
+a job completes. In **GitHub → Settings → Actions → Runners**, a runner appears
+while waiting for or processing a job and deregisters after its single job.
+Run a workflow with `[self-hosted, Linux, ARM64, kvm]` and confirm it succeeds;
+service status alone does not verify a usable runner.
 
-## 5) Run a loop manually (no launchd)
+## Run A Runner Manually
 
 Useful for debugging:
 
@@ -587,54 +715,92 @@ bash tart-runner-loop.sh \
   --index 1
 ```
 
-## Restart / Stop / Uninstall (Ubuntu / KVM runners)
+## Manage Ubuntu Runners
 
-LaunchDaemon mode:
+Use only the commands for the operation you need. The examples below use three
+boot-time runners or two runners that start at sign-in. Adjust the count if yours
+differs. Stopping or restarting a runner can interrupt its job: let jobs finish
+and prevent new assignments first. The image updater is a separate service;
+restarting runners does not restart it.
+
+### Restart Runners
+
+Daemons (example: three runners):
 
 ```bash
-# Stop one runner daemon
-sudo launchctl bootout system/com.github.tart-runner-1
-
-# Start one runner daemon
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.github.tart-runner-1.plist
-
-# Restart runners 1..N (example 1..3)
 for i in 1 2 3; do
   sudo launchctl bootout system/com.github.tart-runner-${i} || true
   sudo launchctl bootstrap system /Library/LaunchDaemons/com.github.tart-runner-${i}.plist
 done
+```
 
-# Optional: stop/delete stale runner clone VMs before restart
-for i in 1 2 3; do
-  tart stop gha-ubuntu-kvm-runner-${i} 2>/dev/null || true
-  tart delete gha-ubuntu-kvm-runner-${i} 2>/dev/null || true
+Agents (example: two runners, run as their owner):
+
+```bash
+for i in 1 2; do
+  launchctl unload "$HOME/Library/LaunchAgents/com.github.tart-runner-${i}.plist" || true
+  launchctl load "$HOME/Library/LaunchAgents/com.github.tart-runner-${i}.plist"
 done
+```
 
-# Remove services 1..N
+### Stop Runners
+
+Services that start at boot:
+
+```bash
+for i in 1 2 3; do
+  sudo launchctl bootout system/com.github.tart-runner-${i}
+done
+```
+
+Services that start at sign-in (run as their owner):
+
+```bash
+for i in 1 2; do
+  launchctl unload "$HOME/Library/LaunchAgents/com.github.tart-runner-${i}.plist"
+done
+```
+
+This keeps the service files. Use [Restart Runners](#restart-runners) to start
+them again. The image updater keeps running unless you stop it separately; see
+[Undo An Image Update](#undo-an-image-update).
+
+### Remove Services
+
+Daemons:
+
+```bash
+sudo launchctl bootout system/com.github.tart-runner-image-refresh || true
+sudo rm -f /Library/LaunchDaemons/com.github.tart-runner-image-refresh.plist
 for i in 1 2 3; do
   sudo launchctl bootout system/com.github.tart-runner-${i} || true
   sudo rm -f /Library/LaunchDaemons/com.github.tart-runner-${i}.plist
 done
-
-# Remove the golden image entirely
-tart delete gha-ubuntu-kvm
 ```
 
-LaunchAgent mode:
+Agents:
 
 ```bash
+launchctl unload "$HOME/Library/LaunchAgents/com.github.tart-runner-image-refresh.plist" || true
+rm -f "$HOME/Library/LaunchAgents/com.github.tart-runner-image-refresh.plist"
 for i in 1 2; do
   launchctl unload ~/Library/LaunchAgents/com.github.tart-runner-${i}.plist || true
   rm -f ~/Library/LaunchAgents/com.github.tart-runner-${i}.plist
 done
 ```
 
-Ephemeral runners deregister themselves automatically (they are configured with
-`--ephemeral`), so there's normally nothing to clean up in the GitHub UI.
+These commands remove services, not VM images, SSH keys, GitHub App keys or build
+caches. To remove the VMs too, first stop all runners and the image updater.
+Then run `tart list` as their owner and delete this setup's images and leftover
+job VMs individually. Only remove its `.current` file after the services have
+stopped. Do not delete images or files used by other runners.
+
+Each runner is registered for one job (`--ephemeral`) and removes its GitHub
+registration afterward. You normally do not need to remove it in GitHub.
 
 ## Troubleshooting
 
-- **Quick monitor workflow (auto snapshot on first crash):**
+- **Save logs when a runner fails:**
 
   ```bash
   # Watch all 3 runners; on first error marker it auto-captures and exits.
@@ -648,7 +814,7 @@ Ephemeral runners deregister themselves automatically (they are configured with
   the generated snapshot file. Use a larger value for more context, or a
   smaller value for shorter snapshots.
 
-  Other modes:
+  To watch logs continuously or save them immediately:
 
   ```bash
   # Continuous live stream (manual Ctrl+C)
@@ -659,7 +825,9 @@ Ephemeral runners deregister themselves automatically (they are configured with
   ```
 
 - **`VZErrorDomain Code=1` / "The virtual machine stopped unexpectedly":** this means the guest process crashed at the Apple Virtualization layer (host-side), not just a workflow failure inside Linux.
-  Enable deep diagnostics and keep failed clones by reinstalling the launchd services with:
+  To collect more detailed logs and keep failed VMs for inspection, reinstall
+  the services with the following command. Replace the organization, App ID and
+  key path with your values, and wait for jobs to finish first:
 
   ```bash
   TART_RUNNER_DEBUG=1 \
@@ -676,22 +844,22 @@ Ephemeral runners deregister themselves automatically (they are configured with
   ```
 
   Then inspect:
-  - `~/.github-runner-logs/tart-runner-<n>-stdout.log` (loop flow)
+  - `~/.github-runner-logs/tart-runner-<n>-stdout.log` (runner activity)
   - `~/.github-runner-logs/tart-runner-<n>-vm-*.log` (raw `tart run` output, includes VZ errors)
   - `~/.github-runner-logs/tart-runner-<n>-vm-diagnostics.log` (host `log show` extract for Tart/Virtualization)
-  - `~/.github-runner-logs/tart-runner-<n>-trace.log` (bash xtrace when debug is enabled)
+  - `~/.github-runner-logs/tart-runner-<n>-trace.log` (shell commands run with debug logging enabled)
 
   With `TART_KEEP_FAILED_VM=1`, failed clones are not deleted, so you can inspect their state with `tart list` and `tart get <vm-name>`.
 
 - **`/dev/kvm` missing / bake fails at `kvm-ok`:** the host isn't M3/M4 on
   macOS 15+, or Tart was started without `--nested`. Nested virt is not
   supported on M1/M2.
-- **Token minting fails:** check the App ID, that the `.pem` matches the App,
+- **Cannot get a registration token:** check the App ID, that the `.pem` matches the App,
   that the App is **installed** on the target repo/org, and that it has the
   Administration / Self-hosted runners write permission.
-- **Guest never gets an IP / SSH:** raise `TART_BOOT_TIMEOUT`; confirm the base
-  image pulled correctly with `tart list`.
+- **VM never gets an IP address or SSH does not connect:** check that the image
+  appears in `tart list`. If boot is slow, increase `TART_BOOT_TIMEOUT`.
 
 ---
 
-**Questions?** Check the logs in `~/.github-runner-logs/` — they're usually the source of truth.
+For other failures, check the logs in `~/.github-runner-logs/`.
