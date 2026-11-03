@@ -317,6 +317,17 @@ main() {
     set_bake_stage "installing patched kernel"
     install_kernel "$ip"
 
+    set_bake_stage "installing guest memory policy"
+    install_guest_memory_policy "$ip"
+    stop_guest "$TART_GOLDEN_IMAGE" "$ip"
+    wait "$tart_pid" 2>/dev/null || true
+    tart run --nested --no-graphics "$TART_GOLDEN_IMAGE" &
+    tart_pid=$!
+    ip="$(tart_guest_ip "$TART_GOLDEN_IMAGE")"
+    [ -n "$ip" ] || die "Rebooted guest has no IP address."
+    wait_for_ssh "$ip" || die "Rebooted guest SSH did not become ready."
+    verify_guest_memory_policy "$ip"
+
     set_bake_stage "completed"
     log "Golden image '$TART_GOLDEN_IMAGE' baked successfully."
     log "Runner version: $RUNNER_VERSION"

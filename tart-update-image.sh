@@ -79,8 +79,8 @@ candidate="${TART_GOLDEN_IMAGE}-runner-v${version}-$(date +%s)-$$"
 log "Checking ${source_image} against runner ${version}; candidate ${candidate}"
 tart clone "$source_image" "$candidate"
 original_memory="$(tart get "$candidate" --format json | jq -er \
-    '.Memory | select(type == "number" and . > 0 and . == floor)')" \
-    || die "Could not read the candidate image memory allocation."
+    '.Memory | select(type == "number" and . > 0 and . == floor)')" ||
+    die "Could not read the candidate image memory allocation."
 tart set "$candidate" --memory "$TART_UPDATE_MEMORY_MB"
 log "Maintenance VM memory: ${TART_UPDATE_MEMORY_MB} MiB (image allocation: ${original_memory} MiB)."
 tart run --nested --no-graphics "$candidate" &
@@ -93,6 +93,14 @@ original_kernel="$(ssh_guest "$guest_ip" 'uname -r')"
 [ -n "$original_kernel" ] || die "Could not determine the current guest kernel."
 upgrade_runner=false
 [ "$installed" = "$version" ] || upgrade_runner=true
+
+ssh_guest "$guest_ip" "test ! -f '${TART_GUEST_RUNNER_DIR}/.runner'" ||
+    die "Refusing to update a registered image."
+policy_changed="$(install_guest_memory_policy "$guest_ip")"
+case "$policy_changed" in
+    true | false) ;;
+    *) die "Invalid guest memory policy result: $policy_changed" ;;
+esac
 
 update_result="$(
     ssh_guest "$guest_ip" "sudo bash -s -- '$TART_GUEST_RUNNER_DIR' '$url' '$checksum' '$upgrade_runner'" <<'UPDATE'
@@ -143,10 +151,15 @@ UPDATE
 case "$update_result" in
     true) ;;
     false)
-        ssh_guest "$guest_ip" 'test -c /dev/kvm && kvm-ok'
-        log "Runner ${version} and guest packages are current; no image promoted."
-        with_image_state_lock prune_runner_images_locked
-        exit 0
+        if [ "$policy_changed" = true ]; then
+            log "Guest memory policy changed; reboot validation is required."
+        else
+            verify_guest_memory_policy "$guest_ip"
+            ssh_guest "$guest_ip" 'test -c /dev/kvm && kvm-ok'
+            log "Runner ${version} and guest packages are current; no image promoted."
+            with_image_state_lock prune_runner_images_locked
+            exit 0
+        fi
         ;;
     *) die "Invalid guest update result: $update_result" ;;
 esac
@@ -163,6 +176,7 @@ installed="$(ssh_guest "$guest_ip" "'${TART_GUEST_RUNNER_DIR}/bin/Runner.Listene
 updated_kernel="$(ssh_guest "$guest_ip" 'uname -r')"
 [ "$updated_kernel" = "$original_kernel" ] || die "Candidate kernel changed: $original_kernel -> $updated_kernel"
 ssh_guest "$guest_ip" 'test -c /dev/kvm && kvm-ok'
+verify_guest_memory_policy "$guest_ip"
 stop_guest "$candidate" "$guest_ip"
 wait "$tart_pid" 2>/dev/null || true
 tart_pid=""
@@ -171,5 +185,5 @@ tart set "$candidate" --memory "$original_memory"
 with_image_state_lock select_runner_image_locked "$candidate"
 promoted=true
 candidate=""
-log "Promoted updated guest packages and runner ${version}; kernel ${original_kernel} preserved."
+log "Promoted validated guest packages, memory policy and runner ${version}; kernel ${original_kernel} preserved."
 with_image_state_lock prune_runner_images_locked

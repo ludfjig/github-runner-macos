@@ -442,6 +442,16 @@ ssh_guest() {
         "${TART_GUEST_USER}@${ip}" "$@"
 }
 
+install_guest_memory_policy() {
+    local ip="$1" payload
+    payload="$(base64 < "$SCRIPT_DIR/tart-guest-memory.sh" | tr -d '\n')" || return 1
+    ssh_guest "$ip" "sudo bash -s -- install '$payload'" < "$SCRIPT_DIR/tart-guest-memory.sh"
+}
+
+verify_guest_memory_policy() {
+    ssh_guest "$1" 'sudo /usr/local/libexec/tart-guest-memory verify'
+}
+
 # Best-effort cleanup for detached `tart run ... <vm>` host processes.
 # If the guest process crashes unexpectedly, these can survive and keep a VM
 # appearing "running" even though the job loop has moved on.

@@ -505,6 +505,12 @@ sudo bash tart-configure-runners.sh 1 8
 
 # Runners 1 and 2: 8 GiB each, on a host with enough RAM for both.
 # sudo bash tart-configure-runners.sh 2 8
+
+# Explicitly overcommit this 16 GiB Mac: two 6 GiB job VMs plus a 4 GiB updater.
+# Remove ubuntu-24.04 from future registrations; retain arm64,kvm,linux.
+# Run updates at 03:00 local time, not immediately on installation.
+sudo bash tart-configure-runners.sh 2 6 --force \
+  --labels arm64,kvm,linux --daily-at 03:00
 ```
 
 This updates `com.github.tart-runner-1` through the requested count and restarts
@@ -515,8 +521,17 @@ Services outside the requested range are untouched. It does not create missing
 runner services or provision a fresh machine; use First Install for that.
 
 The script rejects a selected runner budget plus the updater's 4 GiB when that
-would leave no RAM for macOS. This check does not account for other applications
-or runners outside the selected range. On this 16 GiB Mac, use one 8 GiB runner.
+would leave no RAM for macOS. `--force` overrides **only this budget refusal**,
+with an explicit warning showing job RAM, updater RAM, host RAM and remaining
+macOS headroom. Two 6 GiB jobs plus the 4 GiB updater allocate all 16 GiB;
+forcing this does not make it safe. Guest swap does not increase physical host
+RAM, and the calendar schedule does not prevent overlap with running jobs.
+This check does not account for other applications or runners outside the
+selected range. One 8 GiB runner leaves more headroom on this 16 GiB Mac.
+All argument, platform, privilege and service checks remain mandatory with force.
+`--labels` replaces saved `--labels` arguments (which override environment labels),
+preserving all other arguments and plist settings. Omit it to retain labels.
+The legacy `<runner-count> <memory-gib>` syntax remains supported.
 Service changes are sequential: if a restart fails, the command exits non-zero
 and earlier services may already have changed. Fix the reported error before
 retrying.
@@ -540,6 +555,55 @@ between them on a 16 GiB host. This still leaves limited headroom for macOS and
 native runner jobs; monitor memory pressure under load. It is not a budget for
 multiple simultaneous 8 GiB runners.
 
+### Guest Zram And Disk Swap
+
+Every job clone applies the shared `tart-guest-memory.sh` policy **before runner
+registration**: zstd zram is 50% of detected Linux `MemTotal`, rounded down to
+whole pages, at swap priority **100**, plus **12 GiB of disk-backed swap** at
+priority **10**. The disk allocation is in addition to zram, **not** a 12 GiB
+total swap target. For a guest reporting 6 GiB of usable RAM this means 3 GiB
+zram plus 12 GiB disk; reported usable swap excludes a metadata page per device.
+Linux `MemTotal` is normally slightly smaller than Tart's configured VM RAM.
+Zram consumes guest RAM as pages are compressed; it is not extra physical RAM.
+
+The policy installs an enabled `tart-guest-memory.service` boot service, with
+managed files under `/var/lib/tart-guest-memory` and
+`/usr/local/libexec/tart-guest-memory`. Each reboot calculates zram against the
+RAM actually available at that boot, including the 4 GiB maintenance VM.
+Existing disk swap is reused without reallocation or reformatting. The policy
+does not add an fstab entry or disable other swap. Zram must outrank all other
+enabled swap; unrelated lower-priority swap is preserved.
+
+New bakes install the policy and verify it after reboot. Image refresh migrates
+existing images and promotes policy-only changes even when APT packages and the
+runner version are unchanged, after reboot verification. Job startup also
+installs/reconciles the policy in older and rollback clones, so no destructive
+rebake is needed. A previously unmigrated image needs room for a 12 GiB file
+in each clone until a refreshed image with the policy is selected.
+
+Allocation, formatting, activation, enabled-size, compression and priority
+failures are fatal: no runner is registered, and a failed refresh does not
+replace the selected image. Conflicting enabled/active zram managers, generator
+configuration, unknown zram devices, unowned files or unexpected live sizes
+cause an explicit error rather than disabling services, overwriting files or
+resetting live swap. Inspect and reconcile that existing configuration before
+retrying. Failed partial disk files are preserved for investigation; do not
+delete or reformat them blindly. The old per-job 3 GiB non-fatal zram setup is
+no longer used.
+
+Inside a running Linux guest, diagnose with:
+
+```bash
+free -h
+swapon --show=NAME,TYPE,SIZE,USED,PRIO --bytes
+zramctl --bytes
+systemctl status tart-guest-memory.service
+sudo /usr/local/libexec/tart-guest-memory verify
+df -h /var/lib/tart-guest-memory
+```
+
+### Applying Memory Defaults
+
 To apply these defaults to an existing installation, from this checkout:
 
 ```bash
@@ -559,6 +623,19 @@ To choose a different maintenance budget, pass it explicitly, for example
 `sudo env TART_UPDATE_MEMORY_MB=3072 bash tart-install-image-updater.sh --launchd-user "$USER"`.
 Do not start a second manual update while the installer's update is running.
 Maintenance logs include `Maintenance VM memory: 4096 MiB` at the default budget.
+
+For a daily **03:00 local-time** check without an immediate installation run:
+
+```bash
+sudo bash tart-install-image-updater.sh --launchd-user runner --daily-at 03:00
+```
+
+This explicitly selects `StartCalendarInterval` with `RunAtLoad=false`, instead
+of the default immediate run plus `StartInterval=86400`. Reinstalling unloads
+and reloads the updater service, so do this when no update is running; an active
+check may be interrupted. It does not drain runners. Launchd may deliver a
+missed calendar event on wake, so the schedule is not an exclusion lock or a
+guarantee that two jobs cannot overlap the updater.
 
 ### Automatic Image Retention And Last Known Good (LKG)
 

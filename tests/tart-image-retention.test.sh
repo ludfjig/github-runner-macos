@@ -11,6 +11,7 @@ export TEST_JOB_RESULT=Succeeded TEST_SSH_EXIT=0 TEST_DELETE_FAIL="" TEST_CLONE_
 export TEST_RUNNER_HOST=fixture-mac
 export TART_GUEST_MEMORY_MB=8192 TEST_MEMORY_FAIL=0
 export TEST_BAD_RESOURCES=""
+export TEST_POLICY_FAIL=0
 export PATH="$TEST_ROOT/bin:$PATH"
 mkdir -p "$TEST_ROOT/bin" "$TART_DEBUG_LOG_DIR"
 
@@ -64,6 +65,12 @@ MOCK
 cat > "$TEST_ROOT/bin/ssh" <<'MOCK'
 #!/bin/bash
 set -euo pipefail
+if [[ "${*: -1}" == *'sudo bash -s -- install '* ]]; then
+    cat > "$TEST_ROOT/guest-policy"
+    [ "$TEST_POLICY_FAIL" = 0 ] || exit 1
+    echo false
+    exit 0
+fi
 if [[ "${*: -1}" == *'./run.sh'* ]]; then
     printf '%s\n' "${*: -1}" > "$TEST_ROOT/runner-command"
     printf "Current runner version: '2.338.2'\n"
@@ -260,7 +267,7 @@ printf 'Job finished; tearing down clone\nUpdate finished successfully.\n' > "$T
 echo 'PASS: only a real Succeeded job result counts, including CRLF runner output'
 
 mkdir "$TEST_ROOT/source"
-cp "$SCRIPT_DIR/tart-common.sh" "$TEST_ROOT/source/"
+cp "$SCRIPT_DIR/tart-common.sh" "$SCRIPT_DIR/tart-guest-memory.sh" "$TEST_ROOT/source/"
 cat >> "$TEST_ROOT/source/tart-common.sh" <<'DIAGNOSTICS'
 capture_host_vm_diagnostics() { echo 'fixture VM diagnostics' >&2; }
 DIAGNOSTICS
@@ -291,6 +298,18 @@ for result in Succeeded Failed none; do
     [ -z "$(find "$TART_DEBUG_LOG_DIR" -name '*-job-output.*' -print)" ]
 done
 echo 'PASS: real loop pipeline records successful jobs only and cleans transcript, clone and lease'
+
+reset_case
+rm -f "$TEST_ROOT/runner-command"
+export TEST_POLICY_FAIL=1
+bash "$TEST_ROOT/source/tart-runner-loop.sh" --app-id 123 --private-key "$TEST_ROOT/app.pem" \
+    --repo owner/repo > "$TEST_ROOT/loop-output" 2>&1 || { cat "$TEST_ROOT/loop-output"; exit 1; }
+assert_contains "$TEST_ROOT/loop-output" 'Guest swap validation failed; runner will not register'
+[ ! -f "$TEST_ROOT/runner-command" ]
+[ ! -f "$state/$base.in-use/$base-runner-1" ]
+! exists "$base-runner-1"
+export TEST_POLICY_FAIL=0
+echo 'PASS: required swap failure prevents runner registration and releases the clone and source lease'
 
 reset_case
 export TEST_RUNNER_HOST=second-mac TEST_JOB_RESULT=Succeeded

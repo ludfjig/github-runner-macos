@@ -251,6 +251,13 @@ run_one_job() {
         return 1
     }
 
+    if ! install_guest_memory_policy "$ip"; then
+        run_failed=1
+        fail_reason="required guest memory policy failed"
+        err "[runner ${INDEX}] Guest swap validation failed; runner will not register."
+        return 1
+    fi
+
     local runner_resources
     runner_resources="$(tart get "$CLONE_NAME" --format json | jq -er '
         if (.CPU | type == "number" and . > 0 and . == floor) and
@@ -293,10 +300,6 @@ run_one_job() {
     cache_subdir="${TART_CACHE_GUEST_MOUNT}/${TART_CACHE_TAG}"
     cache_setup="sudo mkdir -p '${TART_CACHE_GUEST_MOUNT}' && (mountpoint -q '${TART_CACHE_GUEST_MOUNT}' || sudo mount -t virtiofs '${TART_VIRTIOFS_AUTOMOUNT_TAG}' '${TART_CACHE_GUEST_MOUNT}')"
 
-    # Best-effort: use zram since some Hyperlight tests have high, but fairly
-    # compressible memory consumption
-    local zram_setup="sudo modprobe zram num_devices=1 && sudo zramctl -a zstd -s 3G /dev/zram0 && sudo mkswap /dev/zram0 && sudo swapon /dev/zram0"
-
     # Install the per-job context hook (base64 to avoid SSH quoting issues).
     local hook_install
     hook_install="echo '${JOB_STARTED_HOOK_B64}' | base64 -d | sudo tee '${GUEST_HOOK_PATH}' >/dev/null && sudo chmod +x '${GUEST_HOOK_PATH}'"
@@ -307,7 +310,6 @@ run_one_job() {
     if ! ssh_guest "$ip" \
         "{ ${cache_setup}; } || echo '[cache] virtio-fs mount failed (non-fatal)'; \
          { ${hook_install}; } || echo '[hook] install failed (non-fatal)'; \
-         { ${zram_setup}; } || echo '[zram] setup failed (non-fatal)'; \
          export SCCACHE_DIR='${cache_subdir}/sccache' SCCACHE_CACHE_SIZE='${TART_CACHE_MAX_SIZE}' ACTIONS_RUNNER_HOOK_JOB_STARTED='${GUEST_HOOK_PATH}'; \
          cd '${TART_GUEST_RUNNER_DIR}' && \
          ./config.sh --unattended --ephemeral --replace \
