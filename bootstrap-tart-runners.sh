@@ -49,11 +49,12 @@ Optional:
   --base-image <ref>       Base OCI image. Default: ghcr.io/cirruslabs/ubuntu:latest.
   --runner-version <x.y.z> Actions runner version baked in. Default: latest.
     --cpus <n>               Guest vCPUs in the baked image. Default: 2.
-    --memory-mb <mb>         Guest RAM in MB in the baked image. Default: 4096.
+    --memory-mb <mb>         Job VM RAM in MiB (new and existing images). Default: 8192.
     --disk-gb <gb>           Guest disk size in GB in the baked image. Default: 50.
   --labels <csv>           Custom runner labels. Default: kvm.
                           GitHub also adds self-hosted, Linux, and ARM64.
   --name-prefix <prefix>   Runner name prefix. Default: tart-ubuntu.
+                          Names are <prefix>-<host>-<index>-<N>cpu-<RAM>-<epoch>.
   --rebuild-image          Force a rebuild of the golden image even if it exists.
   --install-launchd        Install/reload a launchd service per runner.
                           Also installs a daily runner-image refresh job.
@@ -128,6 +129,7 @@ if ! [[ "$COUNT" =~ ^[0-9]+$ ]] || [ "$COUNT" -lt 1 ]; then
     die "--count must be a positive integer."
 fi
 [ -n "$APP_ID" ] || die "--app-id is required."
+validate_memory_mb TART_GUEST_MEMORY_MB "$TART_GUEST_MEMORY_MB"
 [ -n "$PRIVATE_KEY" ] || die "--private-key is required."
 [ -f "$PRIVATE_KEY" ] || die "Private key file not found: $PRIVATE_KEY"
 
@@ -182,14 +184,15 @@ fi
 
 # ---- Golden image -----------------------------------------------------------
 ensure_golden_image() {
-    local exists=false
-    tart list 2>/dev/null | grep -qE "[[:space:]]${TART_GOLDEN_IMAGE}[[:space:]]" && exists=true
-
-    if [ "$exists" = true ] && [ "$REBUILD_IMAGE" = false ]; then
-        log "Golden image '$TART_GOLDEN_IMAGE' already exists (use --rebuild-image to refresh)."
-        return 0
+    local selected
+    if [ "$REBUILD_IMAGE" = false ]; then
+        selected="$(TART_CONFIG_DIR="$CONFIG_DIR_VALUE" current_runner_image)" \
+            || die "Invalid current image pointer."
+        if tart get "$selected" >/dev/null 2>&1; then
+            log "Runner image '$selected' already exists (use --rebuild-image to refresh)."
+            return 0
+        fi
     fi
-
     log "Baking golden image '$TART_GOLDEN_IMAGE'..."
     BAKE_LOCK_DIR="${CONFIG_DIR_VALUE}/images/${TART_GOLDEN_IMAGE}.lock"
     mkdir "$BAKE_LOCK_DIR" 2>/dev/null || die "An image refresh or bake is already locked: $BAKE_LOCK_DIR"
@@ -212,7 +215,7 @@ ensure_golden_image() {
     else
         bash "$SCRIPT_DIR/tart-bake-ubuntu.sh" "${bake_args[@]}"
     fi
-    rm -f "${CONFIG_DIR_VALUE}/images/${TART_GOLDEN_IMAGE}.current"
+    TART_CONFIG_DIR="$CONFIG_DIR_VALUE" with_image_state_lock reset_baked_image_state_locked
     rmdir "$BAKE_LOCK_DIR"
     trap - EXIT
 }
@@ -308,6 +311,8 @@ ${user_block}
         <string>${TART_GUEST_USER}</string>
         <key>TART_GUEST_RUNNER_DIR</key>
         <string>${TART_GUEST_RUNNER_DIR}</string>
+        <key>TART_GUEST_MEMORY_MB</key>
+        <string>${TART_GUEST_MEMORY_MB}</string>
         <key>TART_RUNNER_DEBUG</key>
         <string>${RUNNER_DEBUG_MODE}</string>
         <key>TART_KEEP_FAILED_VM</key>

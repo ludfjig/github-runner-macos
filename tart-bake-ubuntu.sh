@@ -86,6 +86,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+validate_memory_mb TART_GUEST_MEMORY_MB "$TART_GUEST_MEMORY_MB"
 require_cmd tart
 require_cmd ssh
 require_cmd ssh-keygen

@@ -24,6 +24,7 @@ Usage: sudo bash tart-install-image-updater.sh [options]
 Installs the checker to run immediately and every 24 hours. Does not restart
 runner services, bake an image, or require GitHub App credentials.
 Each check updates guest APT packages and the runner, preserving the kernel.
+Maintenance VM RAM: TART_UPDATE_MEMORY_MB (default 4096 MiB).
 USAGE
 }
 
@@ -62,6 +63,7 @@ for command_name in tart jq launchctl plutil; do
 done
 [[ "$TART_GOLDEN_IMAGE" =~ ^[a-zA-Z0-9._-]+$ ]] || die "Unsafe golden image name."
 [[ "$LAUNCHD_LABEL_PREFIX" =~ ^[a-zA-Z0-9._-]+$ ]] || die "Unsafe label prefix."
+validate_memory_mb TART_UPDATE_MEMORY_MB "$TART_UPDATE_MEMORY_MB"
 case "$LAUNCHD_SCOPE" in
     daemon)
         [ "$(id -u)" -eq 0 ] || die "Daemon installation requires sudo."
@@ -95,9 +97,11 @@ arguments="$(jq -cn --arg script "$SCRIPT_DIR/tart-update-image.sh" \
     '["/usr/bin/caffeinate", "-is", "/bin/bash", $script, "--golden-image", $image]')"
 environment="$(jq -cn --arg home "$RUNNER_HOME" --arg config "$CONFIG_DIR_VALUE" \
     --arg key "$TART_SSH_KEY" --arg user "$TART_GUEST_USER" --arg runner "$TART_GUEST_RUNNER_DIR" \
+    --arg memory "$TART_UPDATE_MEMORY_MB" \
     '{HOME: $home, PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
       TART_RUNNER_CONFIG_DIR: $config, TART_SSH_KEY: $key,
-      TART_GUEST_USER: $user, TART_GUEST_RUNNER_DIR: $runner}')"
+      TART_GUEST_USER: $user, TART_GUEST_RUNNER_DIR: $runner,
+      TART_UPDATE_MEMORY_MB: $memory}')"
 plutil -create xml1 "$plist_dest"
 plutil -insert Label -string "$label" "$plist_dest"
 plutil -insert ProgramArguments -json "$arguments" "$plist_dest"

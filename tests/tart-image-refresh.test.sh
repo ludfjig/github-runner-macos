@@ -12,6 +12,9 @@ export TEST_LOG="$TEST_ROOT/commands.log"
 export TEST_INSTALLED=2.336.0 TEST_EXPECTED=2.338.2
 export TEST_FAIL_UPDATE=0 TEST_FAIL_KVM=0 TEST_FAIL_DIGEST=0
 export TEST_PACKAGE_UPDATE=1 TEST_FAIL_PACKAGES=0 TEST_FAIL_KERNEL=0 TEST_CORRUPT_ARCHIVE=0
+export TEST_FAIL_PRUNE=0
+export TART_UPDATE_MEMORY_MB=4096 TEST_IMAGE_MEMORY=8192
+export TEST_FAIL_SET_MEMORY="" TEST_BAD_MEMORY_CONFIG=0
 export TEST_ARCHIVE="$TEST_ROOT/runner.tar.gz"
 mkdir -p "$TEST_ROOT/archive/bin" "$TEST_ROOT/guest-template/bin"
 cat >"$TEST_ROOT/archive/bin/Runner.Listener" <<'LISTENER'
@@ -57,9 +60,39 @@ case "$command_name" in
                 rm -rf "$TEST_ROOT/guest"
                 cp -R "$TEST_ROOT/guest-template" "$TEST_ROOT/guest"
                 rm -f "$TEST_ROOT/updated" "$TEST_ROOT/packages-upgraded"
+                printf '%s\n' "$TEST_IMAGE_MEMORY" > "$TEST_ROOT/guest-memory"
+                ;;
+            get)
+                if [[ "$*" == *'--format json'* ]]; then
+                    if [ "$TEST_BAD_MEMORY_CONFIG" = 1 ]; then
+                        echo '{"Memory":"invalid"}'
+                    else
+                        jq -n --argjson memory "$(cat "$TEST_ROOT/guest-memory")" '{Memory: $memory}'
+                    fi
+                fi
+                ;;
+            set)
+                [ "$3" = --memory ]
+                [ "$4" != "$TEST_FAIL_SET_MEMORY" ] || exit 1
+                printf '%s\n' "$4" > "$TEST_ROOT/guest-memory"
+                ;;
+            run)
+                memory="$(cat "$TEST_ROOT/guest-memory")"
+                [ "$memory" = "$TART_UPDATE_MEMORY_MB" ]
+                printf 'maintenance-boot-memory <%s>\n' "$memory" >> "$TEST_LOG"
                 ;;
             ip) echo 192.0.2.1 ;;
-            list) echo 'local gha-ubuntu-kvm stopped' ;;
+            list)
+                if [[ "$*" == *'--format json'* ]]; then
+                    if [ "$TEST_FAIL_PRUNE" = 1 ] && [ -f "$TEST_ROOT/updated" ]; then
+                        echo '{}'
+                    else
+                        echo '[{"Name":"gha-ubuntu-kvm","State":"stopped","Running":false}]'
+                    fi
+                else
+                    echo 'local gha-ubuntu-kvm stopped'
+                fi
+                ;;
         esac
         ;;
     ssh)
@@ -92,6 +125,10 @@ case "$command_name" in
     dscl) echo "NFSHomeDirectory: $HOME" ;;
     id) echo 0 ;;
     chown) exit 0 ;;
+    stat)
+        [ "$1" = -c ] && [ "$2" = '%u:%g' ]
+        echo 1000:1000
+        ;;
     apt-get)
         if [[ " $* " == *' upgrade '* ]]; then
             [ "$TEST_FAIL_PACKAGES" = 0 ] || exit 1
@@ -137,7 +174,7 @@ PLIST
 esac
 MOCK
 chmod +x "$TEST_ROOT/bin/mock"
-for command_name in curl tart ssh pkill openssl dscl id chown plutil launchctl apt-get apt-mark dpkg-query; do
+for command_name in curl tart ssh pkill openssl dscl id chown stat plutil launchctl apt-get apt-mark dpkg-query; do
     ln -s mock "$TEST_ROOT/bin/$command_name"
 done
 
@@ -162,6 +199,10 @@ assert_contains "$TEST_ROOT/guest-update.sh" 'sha256sum --check'
 assert_contains "$TEST_LOG" 'apt-mark <hold> <linux-image-7.0.0-28-vmid5>'
 assert_contains "$TEST_LOG" 'apt-mark <hold> <linux-headers-7.0.0-28-vmid5>'
 assert_contains "$TEST_LOG" '<--with-new-pkgs> <--no-remove> <-y> <upgrade>'
+[ "$(grep -c '^maintenance-boot-memory <4096>$' "$TEST_LOG")" -eq 2 ]
+[ "$(cat "$TEST_ROOT/guest-memory")" = 8192 ]
+assert_contains "$TEST_LOG" '<--memory> <4096>'
+assert_contains "$TEST_LOG" '<--memory> <8192>'
 bash -n "$TEST_ROOT/guest-update.sh"
 shellcheck --shell=bash -S warning "$TEST_ROOT/guest-update.sh"
 export TART_GOLDEN_IMAGE=gha-ubuntu-kvm
@@ -171,6 +212,61 @@ echo 'PASS: guest payload executes package upgrade, kernel holds and verified ru
 
 : >"$TEST_LOG"
 rm "$TEST_ROOT/updated"
+export TEST_FAIL_PRUNE=1
+if run_refresh > "$TEST_ROOT/prune-failure-output" 2>&1; then
+    echo 'FAIL: post-promotion cleanup failure reported success'
+    exit 1
+fi
+promoted="$(cat "$pointer")"
+assert_contains "$TEST_ROOT/prune-failure-output" 'Image was promoted, but image maintenance failed'
+if grep -Fq 'current image was not replaced' "$TEST_ROOT/prune-failure-output" ||
+    grep -Fq "tart <delete> <$promoted>" "$TEST_LOG"; then
+    echo 'FAIL: cleanup failure misreported or removed the promoted image'
+    exit 1
+fi
+[ ! -d "$TART_RUNNER_CONFIG_DIR/images/gha-ubuntu-kvm.lock" ]
+[ ! -d "$TART_RUNNER_CONFIG_DIR/images/gha-ubuntu-kvm.selection-lock" ]
+export TEST_FAIL_PRUNE=0
+echo 'PASS: cleanup failure returns non-zero without reverting or deleting a promoted image'
+
+: >"$TEST_LOG"
+export TART_UPDATE_MEMORY_MB=2048 TEST_IMAGE_MEMORY=6144
+run_refresh
+promoted="$(cat "$pointer")"
+[ "$(grep -c '^maintenance-boot-memory <2048>$' "$TEST_LOG")" -eq 2 ]
+[ "$(cat "$TEST_ROOT/guest-memory")" = 6144 ]
+export TART_UPDATE_MEMORY_MB=4096 TEST_IMAGE_MEMORY=8192
+echo 'PASS: both maintenance boots use the independent budget and publication restores source image memory'
+
+for fail_memory in 4096 8192; do
+    : >"$TEST_LOG"
+    export TEST_FAIL_SET_MEMORY="$fail_memory"
+    if run_refresh > "$TEST_ROOT/memory-failure-output" 2>&1; then
+        echo 'FAIL: memory configuration failure accepted'
+        exit 1
+    fi
+    [ "$(cat "$pointer")" = "$promoted" ]
+    assert_contains "$TEST_ROOT/memory-failure-output" 'current image was not replaced'
+    if [ "$fail_memory" = 4096 ]; then
+        ! grep -q '^maintenance-boot-memory' "$TEST_LOG"
+    fi
+done
+export TEST_FAIL_SET_MEMORY=""
+: >"$TEST_LOG"
+export TEST_BAD_MEMORY_CONFIG=1
+if run_refresh > "$TEST_ROOT/memory-failure-output" 2>&1; then exit 1; fi
+assert_contains "$TEST_ROOT/memory-failure-output" 'Could not read the candidate image memory allocation'
+[ "$(cat "$pointer")" = "$promoted" ]
+! grep -q '^maintenance-boot-memory' "$TEST_LOG"
+export TEST_BAD_MEMORY_CONFIG=0
+: >"$TEST_LOG"
+if TART_UPDATE_MEMORY_MB=invalid run_refresh > "$TEST_ROOT/memory-failure-output" 2>&1; then exit 1; fi
+assert_contains "$TEST_ROOT/memory-failure-output" 'TART_UPDATE_MEMORY_MB must be a positive integer in MiB'
+! grep -q '^tart <clone>' "$TEST_LOG"
+echo 'PASS: invalid budgets, unreadable memory metadata and failed resize/restore operations prevent publication'
+
+: >"$TEST_LOG"
+rm -f "$TEST_ROOT/updated"
 export TEST_INSTALLED="$TEST_EXPECTED"
 run_refresh
 assert_contains "$TEST_LOG" "clone> <$promoted>"
@@ -272,6 +368,12 @@ bash "$SCRIPT_DIR/tart-install-image-updater.sh" --launchd-user test-user \
     --launchd-dir "$TEST_ROOT/standalone"
 assert_contains "$TEST_LOG" '<StartInterval> <-integer> <86400>'
 assert_contains "$TEST_LOG" "launchctl <bootstrap> <system> <$TEST_ROOT/standalone/com.github.tart-runner-image-refresh.plist>"
+python3 - "$TEST_ROOT/standalone/com.github.tart-runner-image-refresh.plist" <<'PLIST'
+import plistlib
+import sys
+with open(sys.argv[1], "rb") as stream:
+    assert plistlib.load(stream)["EnvironmentVariables"]["TART_UPDATE_MEMORY_MB"] == "4096"
+PLIST
 if grep -Eq '^(tart|ssh|curl) |com.github.tart-runner-[0-9]' "$TEST_LOG"; then
     echo 'FAIL: standalone installer touched an image or runner service'
     exit 1
@@ -291,9 +393,16 @@ echo 'PASS: bootstrap installs scheduled agent and shared image state'
 : >"$TEST_LOG"
 bash "$SCRIPT_DIR/bootstrap-tart-runners.sh" --count 1 --org example \
     --app-id 123 --private-key "$TEST_ROOT/app.pem" --install-launchd \
-    --launchd-scope daemon --launchd-user test-user --launchd-dir "$TEST_ROOT/daemons"
+    --launchd-scope daemon --launchd-user test-user --launchd-dir "$TEST_ROOT/daemons" \
+    --memory-mb 6144
 assert_contains "$TEST_LOG" '<UserName> <-string> <test-user>'
 assert_contains "$TEST_LOG" "launchctl <bootstrap> <system> <$TEST_ROOT/daemons/com.github.tart-runner-image-refresh.plist>"
+python3 - "$TEST_ROOT/daemons/com.github.tart-runner-1.plist" <<'PLIST'
+import plistlib
+import sys
+with open(sys.argv[1], "rb") as stream:
+    assert plistlib.load(stream)["EnvironmentVariables"]["TART_GUEST_MEMORY_MB"] == "6144"
+PLIST
 echo 'PASS: daemon scheduler runs under the runner account'
 
 : >"$TEST_LOG"
@@ -310,9 +419,19 @@ printf 'bake <%s>\n' "$*" >> "$TEST_LOG"
 exit "${TEST_BAKE_EXIT:-0}"
 BAKE
 printf '%s\n' "$promoted" >"$pointer"
+mkdir -p "$TART_RUNNER_CONFIG_DIR/images/gha-ubuntu-kvm.successful"
+touch "$TART_RUNNER_CONFIG_DIR/images/gha-ubuntu-kvm.successful/gha-ubuntu-kvm"
+bash "$TEST_ROOT/bake-fixture/bootstrap-tart-runners.sh" --count 1 --org example \
+    --app-id 123 --private-key "$TEST_ROOT/app.pem" > "$TEST_ROOT/reuse-output"
+assert_contains "$TEST_ROOT/reuse-output" "Runner image '$promoted' already exists"
+if grep -Fq 'bake <' "$TEST_LOG"; then
+    echo 'FAIL: selected versioned image was needlessly rebaked'
+    exit 1
+fi
 bash "$TEST_ROOT/bake-fixture/bootstrap-tart-runners.sh" --count 1 --org example \
     --app-id 123 --private-key "$TEST_ROOT/app.pem" --rebuild-image
 [ ! -f "$pointer" ]
+[ ! -f "$TART_RUNNER_CONFIG_DIR/images/gha-ubuntu-kvm.successful/gha-ubuntu-kvm" ]
 [ ! -d "$TART_RUNNER_CONFIG_DIR/images/gha-ubuntu-kvm.lock" ]
 echo 'PASS: successful full rebake selects rebuilt base and releases lock'
 

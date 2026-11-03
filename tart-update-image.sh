@@ -14,6 +14,7 @@ while [ "$#" -gt 0 ]; do
         -h | --help)
             echo "Usage: bash tart-update-image.sh [--golden-image <name>]"
             echo "Updates guest packages and the Actions runner; preserves the installed kernel."
+            echo "Maintenance VM RAM: TART_UPDATE_MEMORY_MB (default 4096 MiB)."
             exit 0
             ;;
         *) die "Unknown argument: $1" ;;
@@ -25,6 +26,7 @@ for command_name in tart curl jq ssh; do
 done
 [[ "$TART_GOLDEN_IMAGE" =~ ^[a-zA-Z0-9._-]+$ ]] || die "Unsafe golden image name."
 [[ "$TART_GUEST_RUNNER_DIR" =~ ^/[a-zA-Z0-9/._-]+$ ]] || die "Unsafe guest runner directory."
+validate_memory_mb TART_UPDATE_MEMORY_MB "$TART_UPDATE_MEMORY_MB"
 
 state_dir="${TART_CONFIG_DIR}/images"
 mkdir -p "$state_dir"
@@ -47,7 +49,13 @@ cleanup() {
     fi
     rm -f "${state_dir}/${TART_GOLDEN_IMAGE}.current.tmp"
     rmdir "$lock_dir"
-    if [ "$exit_code" -ne 0 ]; then err "Image refresh failed; current image was not replaced."; fi
+    if [ "$exit_code" -ne 0 ]; then
+        if [ "$promoted" = true ]; then
+            err "Image was promoted, but image maintenance failed; see errors above."
+        else
+            err "Image refresh failed; current image was not replaced."
+        fi
+    fi
     exit "$exit_code"
 }
 trap cleanup EXIT
@@ -66,9 +74,15 @@ checksum="${digest#sha256:}"
 url="https://github.com/actions/runner/releases/download/v${version}/${archive}"
 
 source_image="$(current_runner_image)" || die "Invalid current image pointer."
+with_image_state_lock register_runner_images_locked
 candidate="${TART_GOLDEN_IMAGE}-runner-v${version}-$(date +%s)-$$"
 log "Checking ${source_image} against runner ${version}; candidate ${candidate}"
 tart clone "$source_image" "$candidate"
+original_memory="$(tart get "$candidate" --format json | jq -er \
+    '.Memory | select(type == "number" and . > 0 and . == floor)')" \
+    || die "Could not read the candidate image memory allocation."
+tart set "$candidate" --memory "$TART_UPDATE_MEMORY_MB"
+log "Maintenance VM memory: ${TART_UPDATE_MEMORY_MB} MiB (image allocation: ${original_memory} MiB)."
 tart run --nested --no-graphics "$candidate" &
 tart_pid=$!
 guest_ip="$(tart_guest_ip "$candidate")"
@@ -131,6 +145,7 @@ case "$update_result" in
     false)
         ssh_guest "$guest_ip" 'test -c /dev/kvm && kvm-ok'
         log "Runner ${version} and guest packages are current; no image promoted."
+        with_image_state_lock prune_runner_images_locked
         exit 0
         ;;
     *) die "Invalid guest update result: $update_result" ;;
@@ -152,8 +167,9 @@ stop_guest "$candidate" "$guest_ip"
 wait "$tart_pid" 2>/dev/null || true
 tart_pid=""
 guest_ip=""
-printf '%s\n' "$candidate" >"${state_dir}/${TART_GOLDEN_IMAGE}.current.tmp"
-mv "${state_dir}/${TART_GOLDEN_IMAGE}.current.tmp" "${state_dir}/${TART_GOLDEN_IMAGE}.current"
+tart set "$candidate" --memory "$original_memory"
+with_image_state_lock select_runner_image_locked "$candidate"
 promoted=true
 candidate=""
-log "Promoted updated guest packages and runner ${version}; kernel ${original_kernel} preserved. Previous images retained for rollback."
+log "Promoted updated guest packages and runner ${version}; kernel ${original_kernel} preserved."
+with_image_state_lock prune_runner_images_locked

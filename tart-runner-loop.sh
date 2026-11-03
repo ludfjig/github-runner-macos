@@ -24,8 +24,9 @@
 #   GH_RUNNER_ORG  / --org          org
 #   --golden-image                  Golden image name (default from common)
 #   --index                         Runner index (used in the runner name)
-#   --name-prefix                   Runner name prefix (default: tart-ubuntu)
+#   --name-prefix                   Prefix for <prefix>-<host>-<index>-<N>cpu-<RAM>-<epoch> (default: tart-ubuntu)
 #   TART_RUNNER_LABELS / --labels    Comma-separated custom labels (default: kvm)
+#   TART_GUEST_MEMORY_MB            Job VM RAM in MiB (default: 8192)
 
 set -Eeuo pipefail
 
@@ -66,6 +67,7 @@ require_cmd ssh
 require_cmd curl
 require_cmd openssl
 require_cmd jq
+validate_memory_mb TART_GUEST_MEMORY_MB "$TART_GUEST_MEMORY_MB"
 
 [ -n "$APP_ID" ] || die "--app-id (or GH_APP_ID) is required."
 [ -n "$PRIVATE_KEY" ] || die "--private-key (or GH_APP_PRIVATE_KEY) is required."
@@ -81,6 +83,9 @@ if [ -n "$REPO" ]; then
 else
     RUNNER_URL="https://github.com/${ORG}"
 fi
+
+RUNNER_HOST="$(hostname -s)" || die "Could not determine the runner host name."
+[[ "$RUNNER_HOST" =~ ^[a-zA-Z0-9._-]+$ ]] || die "Invalid runner host name: $RUNNER_HOST"
 
 # Stable per-index clone name. Reused each iteration (deleted at end of loop),
 # so leftover clones from a crash are reclaimed on the next pass.
@@ -157,15 +162,18 @@ record_failure_and_maybe_cooldown() {
 
 # Remove a clone if it exists (handles leftovers from a previous crash).
 delete_clone_if_present() {
-    if tart list 2>/dev/null | grep -qE "[[:space:]]${CLONE_NAME}[[:space:]]"; then
+    local listing
+    listing="$(list_local_runner_images)" || return 1
+    if printf '%s' "$listing" | jq -e --arg clone "$CLONE_NAME" 'any(.[]; .Name == $clone)' >/dev/null; then
         stop_guest "$CLONE_NAME" ""
-        tart delete "$CLONE_NAME" 2>/dev/null || true
+        tart delete "$CLONE_NAME" || { err "Could not delete old clone: $CLONE_NAME"; return 1; }
     fi
+    with_image_state_lock release_runner_image_locked "$CLONE_NAME"
 }
 
 # Run a single ephemeral job, returning when the VM has been cleaned up.
 run_one_job() {
-    delete_clone_if_present
+    delete_clone_if_present || return 1
 
     mkdir -p "$TART_DEBUG_LOG_DIR"
     local iter_ts vm_runtime_log run_failed fail_reason
@@ -175,15 +183,14 @@ run_one_job() {
     fail_reason=""
 
     local source_image
-    source_image="$(current_runner_image)" || return 1
+    source_image="$(with_image_state_lock clone_runner_image_locked "$CLONE_NAME")" || return 1
     log "[runner ${INDEX}] Cloning ${source_image} -> ${CLONE_NAME}"
-    tart clone "$source_image" "$CLONE_NAME" || return 1
 
     # Ensure the per-runner host cache dir exists before sharing it in.
     # Non-fatal: caching is an optimization, never a reason to fail a job.
     mkdir -p "${HOST_CACHE_DIR}/sccache" 2>/dev/null || true
 
-    log "[runner ${INDEX}] Booting ephemeral guest with nested virtualization"
+    log "[runner ${INDEX}] Booting ephemeral guest with nested virtualization (${TART_GUEST_MEMORY_MB} MiB RAM)"
     # Only share the cache into the guest if the host dir actually exists, so a
     # cache problem can never block the VM from booting. (Two branches rather
     # than an array, to stay compatible with macOS /bin/bash 3.2 + set -u.)
@@ -195,7 +202,7 @@ run_one_job() {
     local tart_pid=$!
     log "[runner ${INDEX}] Tart runtime log: ${vm_runtime_log}"
 
-    local ip=""
+    local ip="" runner_output=""
     cleanup_job() {
         if [ "$run_failed" -eq 1 ]; then
             capture_host_vm_diagnostics "$RUNNER_LABEL" "$CLONE_NAME"
@@ -216,8 +223,16 @@ run_one_job() {
         if [ "$run_failed" -eq 1 ] && [ "$TART_KEEP_FAILED_VM" = "1" ]; then
             err "[runner ${INDEX}] Keeping failed VM clone for inspection: ${CLONE_NAME}"
         else
-            tart delete "$CLONE_NAME" 2>/dev/null || true
+            if tart delete "$CLONE_NAME"; then
+                with_image_state_lock release_runner_image_locked "$CLONE_NAME" \
+                    || err "[runner ${INDEX}] Could not release image lease."
+                with_image_state_lock prune_runner_images_locked \
+                    || err "[runner ${INDEX}] Old image cleanup failed."
+            else
+                err "[runner ${INDEX}] Could not delete clone; keeping its source image lease."
+            fi
         fi
+        if [ -n "$runner_output" ]; then rm -f "$runner_output"; fi
     }
     trap cleanup_job RETURN
 
@@ -236,6 +251,20 @@ run_one_job() {
         return 1
     }
 
+    local runner_resources
+    runner_resources="$(tart get "$CLONE_NAME" --format json | jq -er '
+        if (.CPU | type == "number" and . > 0 and . == floor) and
+           (.Memory | type == "number" and . > 0 and . == floor)
+        then "\(.CPU)cpu-\(if .Memory % 1024 == 0
+             then "\(.Memory / 1024)GiB" else "\(.Memory)MiB" end)"
+        else error("Invalid VM CPU or memory allocation") end
+    ')" || {
+        run_failed=1
+        fail_reason="could not read VM CPU and memory allocation"
+        err "[runner ${INDEX}] Could not read VM CPU and memory allocation for runner name."
+        return 1
+    }
+
     log "[runner ${INDEX}] Minting registration token"
     local token
     token="$(mint_registration_token "$APP_ID" "$PRIVATE_KEY" "$REPO" "$ORG")" \
@@ -247,7 +276,7 @@ run_one_job() {
         }
 
     local runner_name
-    runner_name="${NAME_PREFIX}-${INDEX}-$(date +%s)"
+    runner_name="${NAME_PREFIX}-${RUNNER_HOST}-${INDEX}-${runner_resources}-$(date +%s)"
     log "[runner ${INDEX}] Configuring + running ephemeral runner: $runner_name"
 
     # Best-effort: mount the shared host cache over virtio-fs and point sccache
@@ -274,6 +303,7 @@ run_one_job() {
 
     # Configure as an ephemeral runner and execute a single job. run.sh blocks
     # until the job finishes, after which the ephemeral runner deregisters.
+    runner_output="$(mktemp "$TART_DEBUG_LOG_DIR/${RUNNER_LABEL}-job-output.XXXXXX")" || return 1
     if ! ssh_guest "$ip" \
         "{ ${cache_setup}; } || echo '[cache] virtio-fs mount failed (non-fatal)'; \
          { ${hook_install}; } || echo '[hook] install failed (non-fatal)'; \
@@ -283,13 +313,19 @@ run_one_job() {
          ./config.sh --unattended --ephemeral --replace \
             --url '${RUNNER_URL}' --token '${token}' \
             --labels '${TART_RUNNER_LABELS}' --name '${runner_name}' && \
-         ./run.sh"; then
+         ./run.sh" | tee "$runner_output"; then
         run_failed=1
         fail_reason="remote runner command exited non-zero"
         err "[runner ${INDEX}] Runner exited non-zero (job may have failed)"
         return 1
     fi
 
+    if runner_job_succeeded "$runner_output"; then
+        with_image_state_lock record_runner_image_success_locked "$source_image" \
+            || err "[runner ${INDEX}] Could not finish recording/pruning successful image."
+    else
+        log "[runner ${INDEX}] No successful job result; image is not newly validated as LKG."
+    fi
     log "[runner ${INDEX}] Job finished; tearing down ${CLONE_NAME}"
     # cleanup_job runs via the RETURN trap.
 }
