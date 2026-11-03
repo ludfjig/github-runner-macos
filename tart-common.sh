@@ -39,13 +39,16 @@ TART_GUEST_PASSWORD="${TART_GUEST_PASSWORD:-admin}"
 TART_BASE_IMAGE="${TART_BASE_IMAGE:-ghcr.io/cirruslabs/ubuntu:latest}"
 TART_GOLDEN_IMAGE="${TART_GOLDEN_IMAGE:-gha-ubuntu-kvm}"
 
-# Guest resources. Defaults are conservative; raise for heavier workloads.
-# NOTE: CPUs/RAM default to 2/4096 while we investigate nested-virt VM crashes
-# (see INCIDENT-tart-vm-crash.md). These are current operating values under
-# investigation, not a confirmed fix — revisit once findings are verified.
+# Defaults target one job VM on a 16 GiB Mac; maintenance uses a smaller VM.
+# Resource sizing is not a fix for the crashes in INCIDENT-tart-vm-crash.md.
 TART_GUEST_CPUS="${TART_GUEST_CPUS:-2}"
-TART_GUEST_MEMORY_MB="${TART_GUEST_MEMORY_MB:-4096}"
+TART_GUEST_MEMORY_MB="${TART_GUEST_MEMORY_MB:-8192}"
+TART_UPDATE_MEMORY_MB="${TART_UPDATE_MEMORY_MB:-4096}"
 TART_GUEST_DISK_GB="${TART_GUEST_DISK_GB:-50}"
+
+validate_memory_mb() {
+    [[ "$2" =~ ^[1-9][0-9]*$ ]] || die "$1 must be a positive integer in MiB."
+}
 
 # Where the GitHub Actions runner is installed inside the guest.
 TART_GUEST_RUNNER_DIR="${TART_GUEST_RUNNER_DIR:-/opt/actions-runner}"
@@ -58,6 +61,186 @@ current_runner_image() {
     fi
     [[ "$image" =~ ^[a-zA-Z0-9._-]+$ ]] || return 1
     printf '%s\n' "$image"
+}
+
+# Locked callbacks share state_dir for selection, leases and retention records.
+with_image_state_lock() (
+    [[ "$TART_GOLDEN_IMAGE" =~ ^[a-zA-Z0-9._-]+$ ]] || {
+        err "Unsafe golden image name."
+        return 1
+    }
+    local state_dir="$TART_CONFIG_DIR/images"
+    local selection_lock="$state_dir/$TART_GOLDEN_IMAGE.selection-lock"
+    local attempts=0
+    mkdir -p "$state_dir" || return 1
+    until mkdir "$selection_lock" 2>/dev/null; do
+        attempts=$((attempts + 1))
+        if [ "$attempts" -ge 30 ]; then
+            err "Image selection is locked: $selection_lock; check for running maintenance before removing a stale lock."
+            return 1
+        fi
+        sleep 1
+    done
+    trap 'rmdir "$selection_lock"' EXIT
+    "$@"
+)
+
+managed_runner_image() {
+    local image="$1" suffix
+    [ "$image" != "$TART_GOLDEN_IMAGE" ] || return 0
+    suffix="${image#"$TART_GOLDEN_IMAGE-runner-v"}"
+    [ "$suffix" != "$image" ] &&
+        [[ "$suffix" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-[0-9]+$ ]]
+}
+
+list_local_runner_images() {
+    local listing
+    listing="$(tart list --source local --format json)" || {
+        err "Could not list Tart images."
+        return 1
+    }
+    printf '%s' "$listing" | jq -e 'type == "array" and all(.[];
+        (.Name | type == "string") and (.State | type == "string") and
+        (.Running | type == "boolean"))' >/dev/null || {
+        err "Invalid Tart image list; refusing image maintenance."
+        return 1
+    }
+    printf '%s\n' "$listing"
+}
+
+register_runner_images_locked() {
+    local listing names image
+    listing="$(list_local_runner_images)" || return 1
+    names="$(printf '%s' "$listing" | jq -r '.[].Name')" || return 1
+    mkdir -p "$state_dir/$TART_GOLDEN_IMAGE.managed" || return 1
+    while IFS= read -r image; do
+        if managed_runner_image "$image"; then
+            touch "$state_dir/$TART_GOLDEN_IMAGE.managed/$image" || return 1
+        fi
+    done <<< "$names"
+}
+
+clone_runner_image_locked() {
+    local clone="$1" image
+    [[ "$clone" =~ ^[a-zA-Z0-9._-]+$ ]] || { err "Unsafe clone name: $clone"; return 1; }
+    validate_memory_mb TART_GUEST_MEMORY_MB "$TART_GUEST_MEMORY_MB"
+    image="$(current_runner_image)" || { err "Invalid current image pointer."; return 1; }
+    mkdir -p "$state_dir/$TART_GOLDEN_IMAGE.in-use" || return 1
+    printf '%s\n' "$image" > "$state_dir/$TART_GOLDEN_IMAGE.in-use/$clone" || return 1
+    if ! tart clone "$image" "$clone" >&2; then
+        err "Failed to clone runner image: $image"
+        rm -f "$state_dir/$TART_GOLDEN_IMAGE.in-use/$clone"
+        return 1
+    fi
+    if ! tart set "$clone" --memory "$TART_GUEST_MEMORY_MB" >&2; then
+        err "Could not set job VM memory to ${TART_GUEST_MEMORY_MB} MiB: $clone"
+        if tart delete "$clone" >&2; then
+            rm -f "$state_dir/$TART_GOLDEN_IMAGE.in-use/$clone"
+        else
+            err "Could not delete clone after memory configuration failure; retaining its source lease."
+        fi
+        return 1
+    fi
+    printf '%s\n' "$image"
+}
+
+release_runner_image_locked() {
+    local clone="$1"
+    [[ "$clone" =~ ^[a-zA-Z0-9._-]+$ ]] || { err "Unsafe clone name: $clone"; return 1; }
+    rm -f "$state_dir/$TART_GOLDEN_IMAGE.in-use/$clone"
+}
+
+select_runner_image_locked() {
+    local image="$1"
+    managed_runner_image "$image" || { err "Not a managed runner image: $image"; return 1; }
+    tart get "$image" >/dev/null || return 1
+    mkdir -p "$state_dir/$TART_GOLDEN_IMAGE.managed" || return 1
+    touch "$state_dir/$TART_GOLDEN_IMAGE.managed/$image" || return 1
+    printf '%s\n' "$image" > "$state_dir/$TART_GOLDEN_IMAGE.current.tmp" || return 1
+    mv "$state_dir/$TART_GOLDEN_IMAGE.current.tmp" "$state_dir/$TART_GOLDEN_IMAGE.current"
+}
+
+reset_baked_image_state_locked() {
+    rm -f "$state_dir/$TART_GOLDEN_IMAGE.successful/$TART_GOLDEN_IMAGE" \
+        "$state_dir/$TART_GOLDEN_IMAGE.current"
+}
+
+prune_runner_images_locked() {
+    local current listing image entry successful=false lkg="" rank best_rank=-1 lease in_use clones clone suffix fallback=""
+    local image_pid best_pid=-1
+    current="$(current_runner_image)" || { err "Invalid current image pointer; refusing cleanup."; return 1; }
+    listing="$(list_local_runner_images)" || return 1
+    for entry in "$state_dir/$TART_GOLDEN_IMAGE.managed/"*; do
+        [ -f "$entry" ] || continue
+        image="${entry##*/}"
+        managed_runner_image "$image" || { err "Invalid managed image record: $image"; return 1; }
+        [ -f "$state_dir/$TART_GOLDEN_IMAGE.successful/$image" ] || continue
+        printf '%s' "$listing" | jq -e --arg image "$image" 'any(.[]; .Name == $image)' >/dev/null || continue
+        successful=true
+        [ "$image" != "$current" ] || continue
+        rank=0
+        image_pid=0
+        if [ "$image" != "$TART_GOLDEN_IMAGE" ]; then
+            rank="${image%-*}"
+            rank="${rank##*-}"
+            image_pid="${image##*-}"
+        fi
+        if [ "$rank" -gt "$best_rank" ] ||
+            { [ "$rank" -eq "$best_rank" ] && [ "$image_pid" -gt "$best_pid" ]; }; then
+            lkg="$image"
+            best_rank="$rank"
+            best_pid="$image_pid"
+        fi
+    done
+    if [ -n "$lkg" ]; then
+        printf '%s\n' "$lkg" > "$state_dir/$TART_GOLDEN_IMAGE.lkg.tmp" || return 1
+        mv "$state_dir/$TART_GOLDEN_IMAGE.lkg.tmp" "$state_dir/$TART_GOLDEN_IMAGE.lkg" || return 1
+    else
+        rm -f "$state_dir/$TART_GOLDEN_IMAGE.lkg" || return 1
+    fi
+    if [ "$successful" = false ]; then
+        fallback="$TART_GOLDEN_IMAGE"
+        log "No job-proven LKG yet; retaining the original image as an unvalidated bootstrap fallback."
+    fi
+    clones="$(printf '%s' "$listing" | jq -r '.[].Name')" || return 1
+    while IFS= read -r clone; do
+        suffix="${clone#"$TART_GOLDEN_IMAGE-runner-"}"
+        if [ "$suffix" != "$clone" ] && [[ "$suffix" =~ ^[0-9]+$ ]] &&
+            [ ! -f "$state_dir/$TART_GOLDEN_IMAGE.in-use/$clone" ]; then
+            log "Retaining images: clone $clone has no source lease; restart its old runner loop to enable safe cleanup."
+            return 0
+        fi
+    done <<< "$clones"
+    for entry in "$state_dir/$TART_GOLDEN_IMAGE.managed/"*; do
+        [ -f "$entry" ] || continue
+        image="${entry##*/}"
+        [ "$image" != "$current" ] && [ "$image" != "$lkg" ] && [ "$image" != "$fallback" ] || continue
+        in_use=false
+        for lease in "$state_dir/$TART_GOLDEN_IMAGE.in-use/"*; do
+            [ -f "$lease" ] || continue
+            if grep -Fxq -- "$image" "$lease"; then in_use=true; break; fi
+        done
+        [ "$in_use" = false ] || continue
+        printf '%s' "$listing" | jq -e --arg image "$image" \
+            'any(.[]; .Name == $image and .State == "stopped" and .Running == false)' >/dev/null || continue
+        log "Deleting superseded runner image: $image"
+        tart delete "$image" || { err "Failed to delete superseded runner image: $image"; return 1; }
+        rm -f "$entry" "$state_dir/$TART_GOLDEN_IMAGE.successful/$image" || return 1
+    done
+}
+
+record_runner_image_success_locked() {
+    local image="$1"
+    managed_runner_image "$image" || { err "Not a managed runner image: $image"; return 1; }
+    mkdir -p "$state_dir/$TART_GOLDEN_IMAGE.managed" "$state_dir/$TART_GOLDEN_IMAGE.successful" || return 1
+    touch "$state_dir/$TART_GOLDEN_IMAGE.managed/$image" \
+        "$state_dir/$TART_GOLDEN_IMAGE.successful/$image" || return 1
+    log "Runner image completed a successful job: $image"
+    prune_runner_images_locked
+}
+
+runner_job_succeeded() {
+    LC_ALL=C grep -Eq $'^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}Z: Job .+ completed with result: Succeeded\r?$' "$1"
 }
 
 # Persistent host-side build cache, shared into each ephemeral guest over
@@ -257,6 +440,16 @@ ssh_guest() {
     shift
     ssh -i "$TART_SSH_KEY" "${TART_SSH_OPTS[@]}" -o BatchMode=yes \
         "${TART_GUEST_USER}@${ip}" "$@"
+}
+
+install_guest_memory_policy() {
+    local ip="$1" payload
+    payload="$(base64 < "$SCRIPT_DIR/tart-guest-memory.sh" | tr -d '\n')" || return 1
+    ssh_guest "$ip" "sudo bash -s -- install '$payload'" < "$SCRIPT_DIR/tart-guest-memory.sh"
+}
+
+verify_guest_memory_policy() {
+    ssh_guest "$1" 'sudo /usr/local/libexec/tart-guest-memory verify'
 }
 
 # Best-effort cleanup for detached `tart run ... <vm>` host processes.

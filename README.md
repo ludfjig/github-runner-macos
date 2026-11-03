@@ -317,6 +317,8 @@ These register as separate runners. You can use them alongside the macOS runners
 
 - `bootstrap-tart-runners.sh`: prepares the image if needed; with `--install-launchd`, installs runner services and the daily image updater.
 - `tart-install-image-updater.sh`: installs daily image updates without changing runner services.
+- `tart-configure-runners.sh`: changes RAM for existing runner services 1 through N,
+  restarts them, and installs the daily image updater with a separate 4 GiB budget.
 - `tart-update-image.sh`: updates Ubuntu packages and the GitHub runner in a verified image clone.
 - `tart-bake-ubuntu.sh`: prepares the Ubuntu 24.04 image with the runner and KVM support.
 - `tart-runner-loop.sh`: repeatedly creates a VM, runs one job and deletes the VM.
@@ -417,16 +419,18 @@ version. Routine updates to an existing image do not need these packages.
 ### 3. Install The Ubuntu Runners
 
 Replace the organization, App ID and private-key path with your values. This
-installs three runners that start after reboot without anyone signing in:
+installs one runner that starts after reboot without anyone signing in. The
+single-runner example is suitable for a 16 GiB Mac; multiple runners need more
+memory:
 
 ```bash
 sudo bash bootstrap-tart-runners.sh \
-  --count 3 \
+  --count 1 \
   --org your-org \
   --app-id 123456 \
   --private-key "$HOME/.config/github-runner-tart/app.private-key.pem" \
   --cpus 2 \
-  --memory-mb 4096 \
+  --memory-mb 8192 \
   --disk-gb 50 \
   --install-launchd \
   --launchd-scope daemon \
@@ -454,6 +458,21 @@ keep using the previous image.
 
 ## Update Ubuntu Packages And GitHub Runner
 
+**Upgrading an existing installation to these scripts:** pulling new scripts
+does not reload an already-running Bash runner loop. If the loop was started
+before image-selection support was added, it will keep cloning the old image
+even after the updater selects a new one. Prevent new jobs from starting, let
+current jobs finish, then [restart each runner once](#restart-runners) to load
+the new code. Do not restart during a job: restarting interrupts it.
+
+The automatic LKG retention feature also needs a one-time restart of **all**
+existing runner loops to load job-result tracking and source-image leases.
+Until an older loop is restarted, its untracked clone blocks image cleanup.
+
+After that one-time restart, the loop reads the selected image before every
+clone. Routine image updates then apply to the next VM without restarting the
+runner service; jobs already running keep their existing VM.
+
 Run as the account that owns the Tart VMs, **without sudo**. No bootstrap,
 GitHub App credentials, full rebake or local kernel packages are needed:
 
@@ -472,7 +491,183 @@ keep using the previous image. If nothing changed, the extra copy is deleted.
 These checks do not replace running a real workflow.
 
 Running jobs are not affected. The Mac needs enough memory and disk for one extra
-VM during the update. Old images stay on disk until you delete them.
+VM during the update. Superseded images are cleaned up automatically as described
+below.
+
+### Job And Maintenance VM Memory
+
+For existing system runner services, set a runner count and RAM **per runner in
+GiB** with one command:
+
+```bash
+# Runner 1: 8 GiB, plus the daily image-update service at 4 GiB.
+sudo bash tart-configure-runners.sh 1 8
+
+# Runners 1 and 2: 8 GiB each, on a host with enough RAM for both.
+# sudo bash tart-configure-runners.sh 2 8
+
+# Explicitly overcommit this 16 GiB Mac: two 6 GiB job VMs plus a 4 GiB updater.
+# Remove ubuntu-24.04 from future registrations; retain arm64,kvm,linux.
+# Run updates at 03:00 local time, not immediately on installation.
+sudo bash tart-configure-runners.sh 2 6 --force \
+  --labels arm64,kvm,linux --daily-at 03:00
+```
+
+This updates `com.github.tart-runner-1` through the requested count and restarts
+them, interrupting running jobs. It checks every target before changing any:
+services must already be installed and loaded as system LaunchDaemons, point to
+this checkout, and share the same Tart owner, image and connection settings.
+Services outside the requested range are untouched. It does not create missing
+runner services or provision a fresh machine; use First Install for that.
+
+The script rejects a selected runner budget plus the updater's 4 GiB when that
+would leave no RAM for macOS. `--force` overrides **only this budget refusal**,
+with an explicit warning showing job RAM, updater RAM, host RAM and remaining
+macOS headroom. Two 6 GiB jobs plus the 4 GiB updater allocate all 16 GiB;
+forcing this does not make it safe. Guest swap does not increase physical host
+RAM, and the calendar schedule does not prevent overlap with running jobs.
+This check does not account for other applications or runners outside the
+selected range. One 8 GiB runner leaves more headroom on this 16 GiB Mac.
+All argument, platform, privilege and service checks remain mandatory with force.
+`--labels` replaces saved `--labels` arguments (which override environment labels),
+preserving all other arguments and plist settings. Omit it to retain labels.
+The legacy `<runner-count> <memory-gib>` syntax remains supported.
+Service changes are sequential: if a restart fails, the command exits non-zero
+and earlier services may already have changed. Fix the reported error before
+retrying.
+
+Job VMs use **8192 MiB (8 GiB)** by default. The loop applies this allocation to
+each disposable clone before boot, including clones of existing images and LKG
+images; no rebake or manual image resize is needed. CPUs remain unchanged.
+`--memory-mb` on bootstrap sets the job allocation in both the baked image and
+the installed runner service. For a manually started loop, use
+`TART_GUEST_MEMORY_MB`. Existing services without a saved memory override use
+the new default after a restart; explicit saved overrides are still respected.
+
+The updater uses **4096 MiB (4 GiB)**, independently of job memory. It applies
+`TART_UPDATE_MEMORY_MB` before the maintenance VM's first boot and keeps that
+allocation for reboot validation. After stopping the validated VM, it restores
+the source image's original allocation before publication. Thus maintenance
+does not accidentally shrink the image or inherit an 8 GiB job budget.
+
+One 8 GiB job VM and one 4 GiB maintenance VM can overlap, allocating 12 GiB
+between them on a 16 GiB host. This still leaves limited headroom for macOS and
+native runner jobs; monitor memory pressure under load. It is not a budget for
+multiple simultaneous 8 GiB runners.
+
+### Guest Zram And Disk Swap
+
+Every job clone applies the shared `tart-guest-memory.sh` policy **before runner
+registration**: zstd zram is 50% of detected Linux `MemTotal`, rounded down to
+whole pages, at swap priority **100**, plus **12 GiB of disk-backed swap** at
+priority **10**. The disk allocation is in addition to zram, **not** a 12 GiB
+total swap target. For a guest reporting 6 GiB of usable RAM this means 3 GiB
+zram plus 12 GiB disk; reported usable swap excludes a metadata page per device.
+Linux `MemTotal` is normally slightly smaller than Tart's configured VM RAM.
+Zram consumes guest RAM as pages are compressed; it is not extra physical RAM.
+
+The policy installs an enabled `tart-guest-memory.service` boot service, with
+managed files under `/var/lib/tart-guest-memory` and
+`/usr/local/libexec/tart-guest-memory`. Each reboot calculates zram against the
+RAM actually available at that boot, including the 4 GiB maintenance VM.
+Existing disk swap is reused without reallocation or reformatting. The policy
+does not add an fstab entry or disable other swap. Zram must outrank all other
+enabled swap; unrelated lower-priority swap is preserved.
+
+New bakes install the policy and verify it after reboot. Image refresh migrates
+existing images and promotes policy-only changes even when APT packages and the
+runner version are unchanged, after reboot verification. Job startup also
+installs/reconciles the policy in older and rollback clones, so no destructive
+rebake is needed. A previously unmigrated image needs room for a 12 GiB file
+in each clone until a refreshed image with the policy is selected.
+
+Allocation, formatting, activation, enabled-size, compression and priority
+failures are fatal: no runner is registered, and a failed refresh does not
+replace the selected image. Conflicting enabled/active zram managers, generator
+configuration, unknown zram devices, unowned files or unexpected live sizes
+cause an explicit error rather than disabling services, overwriting files or
+resetting live swap. Inspect and reconcile that existing configuration before
+retrying. Failed partial disk files are preserved for investigation; do not
+delete or reformat them blindly. The old per-job 3 GiB non-fatal zram setup is
+no longer used.
+
+Inside a running Linux guest, diagnose with:
+
+```bash
+free -h
+swapon --show=NAME,TYPE,SIZE,USED,PRIO --bytes
+zramctl --bytes
+systemctl status tart-guest-memory.service
+sudo /usr/local/libexec/tart-guest-memory verify
+df -h /var/lib/tart-guest-memory
+```
+
+### Applying Memory Defaults
+
+To apply these defaults to an existing installation, from this checkout:
+
+```bash
+# Save the updater's 4 GiB budget; installation also starts an update check.
+sudo bash tart-install-image-updater.sh --launchd-user "$USER"
+
+# Reload runner 1 to use 8 GiB for its next VM. This interrupts a running job.
+sudo launchctl bootout system/com.github.tart-runner-1 &&
+  sudo launchctl bootstrap system /Library/LaunchDaemons/com.github.tart-runner-1.plist
+
+# After the new VM boots, its Memory column should read 8192.
+tart get gha-ubuntu-kvm-runner-1
+```
+
+The installer saves `TART_UPDATE_MEMORY_MB` in the updater's launchd environment.
+To choose a different maintenance budget, pass it explicitly, for example
+`sudo env TART_UPDATE_MEMORY_MB=3072 bash tart-install-image-updater.sh --launchd-user "$USER"`.
+Do not start a second manual update while the installer's update is running.
+Maintenance logs include `Maintenance VM memory: 4096 MiB` at the default budget.
+
+For a daily **03:00 local-time** check without an immediate installation run:
+
+```bash
+sudo bash tart-install-image-updater.sh --launchd-user runner --daily-at 03:00
+```
+
+This explicitly selects `StartCalendarInterval` with `RunAtLoad=false`, instead
+of the default immediate run plus `StartInterval=86400`. Reinstalling unloads
+and reloads the updater service, so do this when no update is running; an active
+check may be interrupted. It does not drain runners. Launchd may deliver a
+missed calendar event on wake, so the schedule is not an exclusion lock or a
+guarantee that two jobs cannot overlap the updater.
+
+### Automatic Image Retention And Last Known Good (LKG)
+
+The updater and runner loops keep:
+
+- The image currently selected for new VMs.
+- One previous **job-proven** image for rollback: the newest previous image whose
+  runner reported `completed with result: Succeeded` for a real job.
+
+Booting, passing KVM checks, successfully updating the runner, or the runner
+process merely exiting with code 0 does **not** make an image LKG. A successful
+job is sufficient; other jobs in the same workflow do not have to succeed.
+Failed, cancelled or skipped jobs do not establish LKG.
+
+Before any successful job has been recorded, the original image is kept as an
+explicitly **unvalidated** bootstrap fallback, alongside the selected image.
+Older unproven updates are still pruned, so daily updates do not accumulate
+indefinitely while waiting for the first successful job. Historical jobs from
+before this feature was loaded are not retroactively counted.
+
+Cleanup runs after image-update checks and runner clone cleanup. It only deletes
+stopped images belonging to this golden-image family. Images used by active or
+retained diagnostic clones are protected until those clones are removed; unrelated
+VMs are never pruned. These temporary protections can leave more than two images.
+All selections, source leases, success records and deletions are serialized to
+avoid races between runners and the updater. Cleanup errors are logged and
+retried at later cleanup opportunities.
+
+The selected image is recorded in
+`~/.config/github-runner-tart/images/gha-ubuntu-kvm.current`; the previous job-proven
+rollback image, when available, is in the corresponding `.lkg` file. With custom
+golden-image or config-directory settings, these paths use those values instead.
 
 You still need to handle these separately:
 
@@ -501,7 +696,7 @@ If you previously installed the updater before the scripts were renamed, run
 the same command again to fix the saved script path. Its service label and log
 filenames still contain `image-refresh`.
 
-For older runners that do not yet support updated images, also
+For older runners that do not yet support updated images or LKG tracking, also
 [restart the runners once](#restart-runners), after their jobs finish.
 Their logs should then show `Cloning <selected-image> -> ...` using the image
 listed under [Check Whether Updates Worked](#check-whether-updates-worked).
@@ -525,7 +720,8 @@ an update failed. Normal package-install output also goes into the stderr log;
 text in that file does not by itself mean failure. There are no email or other
 failure notifications.
 
-To see which image new jobs will use:
+To see which image is selected for new jobs (this alone does not prove a running
+loop is using it):
 
 ```bash
 image_file="$HOME/.config/github-runner-tart/images/gha-ubuntu-kvm.current"
@@ -536,8 +732,37 @@ else
 fi
 ```
 
-Jobs already running keep their existing VM. Confirm a real workflow succeeds
-after an update; an installed service alone does not prove the runners work.
+Then check the runner log, not just the image pointer:
+
+```bash
+tail -n 100 -F "$HOME/.github-runner-logs/tart-runner-1-stdout.log"
+```
+
+For the first VM created after the update, confirm all three:
+
+1. `Cloning <selected-image> -> ...` names the image from the pointer above.
+2. `Current runner version: '<version>'` reports the expected version immediately
+   at startup, without first downloading an update.
+3. A real job ends with `completed with result: Succeeded`.
+
+The loop then logs `Runner image completed a successful job: <image>`.
+`Deleting superseded runner image: <image>` records automatic cleanup.
+To see the previous job-proven rollback image:
+
+```bash
+cat "$HOME/.config/github-runner-tart/images/gha-ubuntu-kvm.lkg"
+```
+
+If that file is absent, no previous job-proven image is currently available.
+
+If the pointer names a versioned image but a newly created VM still clones
+`gha-ubuntu-kvm`, [restart the old runner loop once](#restart-runners) after its
+job finishes. A runner that auto-updates inside an old VM does not prove the new
+image was used. Likewise, `Job finished; tearing down` alone does not prove a
+workflow succeeded.
+
+Jobs already running keep their existing VM. An installed service or a
+successful image check alone does not prove the runners work.
 
 ## Undo An Image Update
 
@@ -551,10 +776,10 @@ Use this only if an updated image causes problems.
 
 2. Prevent new jobs from starting, let current jobs finish, then
    [stop the runners](#stop-runners).
-3. Run `tart list` to see the saved images. Choose one that worked before the
-   update. In the block below, set `rollback_image` to its name. The default
-   shown, `gha-ubuntu-kvm`, is the original image, not necessarily the most
-   recent working one.
+3. Use the `.lkg` file to select the previous image that completed a successful
+   job. The original `gha-ubuntu-kvm` image may already have been pruned; do not
+   assume it is still available. If there is no `.lkg` file, stop and inspect
+   the available images with `tart list` rather than guessing a known-good image.
 4. From the folder containing these scripts, run this as the account that owns
    the VMs, without sudo:
 
@@ -562,14 +787,13 @@ Use this only if an updated image causes problems.
    bash <<'ROLLBACK'
    set -euo pipefail
    source ./tart-common.sh
-   rollback_image="gha-ubuntu-kvm"
+   rollback_image="$(cat "$TART_CONFIG_DIR/images/$TART_GOLDEN_IMAGE.lkg")"
    state_dir="$TART_CONFIG_DIR/images"
    lock_dir="$state_dir/$TART_GOLDEN_IMAGE.lock"
    tart get "$rollback_image" >/dev/null
    mkdir "$lock_dir"
-   trap 'rm -f "$state_dir/$TART_GOLDEN_IMAGE.current.tmp"; rmdir "$lock_dir"' EXIT
-   printf '%s\n' "$rollback_image" > "$state_dir/$TART_GOLDEN_IMAGE.current.tmp"
-   mv "$state_dir/$TART_GOLDEN_IMAGE.current.tmp" "$state_dir/$TART_GOLDEN_IMAGE.current"
+   trap 'rmdir "$lock_dir"' EXIT
+   with_image_state_lock select_runner_image_locked "$rollback_image"
    ROLLBACK
    ```
 
@@ -581,10 +805,10 @@ Use this only if an updated image causes problems.
    again, rerun the daily-update installation command; this immediately starts
    another update check.
 
-Old images are not deleted automatically. Once you have confirmed a replacement
-works, use `tart delete <image-name>` to remove images you no longer need.
-Keep the original image, the image chosen for new jobs, and any image still in
-use.
+Old images are deleted automatically according to
+[Automatic Image Retention And Last Known Good (LKG)](#automatic-image-retention-and-last-known-good-lkg).
+Do not manually delete the selected image, the `.lkg` image, or an image still
+in use.
 
 ## Reference
 
@@ -621,10 +845,22 @@ Common options for `bash bootstrap-tart-runners.sh` (run with `--help` for the f
 - `--base-image <ref>`: Ubuntu image to start from (default `ghcr.io/cirruslabs/ubuntu:latest`).
 - `--runner-version <x.y.z>`: runner version to install when creating the image. Later image updates install the latest version, and the runner can also update itself.
 - `--cpus <n>`: set guest vCPU count in the baked image.
-- `--memory-mb <mb>`: set guest RAM in MB in the baked image.
+- `--memory-mb <mb>`: set job VM RAM in MiB (default `8192`) for the baked image
+  and every disposable job VM. Maintenance RAM is configured separately with
+  `TART_UPDATE_MEMORY_MB` (default `4096`); see
+  [Job And Maintenance VM Memory](#job-and-maintenance-vm-memory).
 - `--disk-gb <gb>`: set guest disk size in GB in the baked image.
 - `--labels <csv>`: comma-separated custom labels (default `kvm`). Keep `kvm` when adding labels for KVM jobs. GitHub's automatic labels are unchanged. This option overrides `TART_RUNNER_LABELS` if set.
 - `--name-prefix <prefix>`: runner name prefix (default `tart-ubuntu`).
+  GitHub runner names are `<prefix>-<host>-<index>-<N>cpu-<RAM>-<epoch>`, for example
+  `tart-ubuntu-Simons-Mac-mini-1-2cpu-8GiB-1793723469`. CPU and RAM come from the
+  actual job VM configuration, not assumed defaults. RAM is shown in whole GiB
+  when exact, otherwise MiB (for example `1536MiB`), without rounding.
+  The host is the Mac's short hostname
+  (`hostname -s`), so runners on different Macs can be distinguished. Custom
+  prefixes still include the hostname. VM names and launchd service labels do
+  not change. Existing services need only a runner restart to load this naming
+  change; their saved `--name-prefix` continues to work without reinstalling.
 - `--rebuild-image`: force a rebuild of the golden image.
 - `--install-launchd`: install or reload runner services and the daily image updater.
 - `--no-image-refresh`: skip installing the image updater; does not remove an existing updater.
@@ -724,6 +960,22 @@ and prevent new assignments first. The image updater is a separate service;
 restarting runners does not restart it.
 
 ### Restart Runners
+
+First prevent new jobs from starting and wait for current jobs to finish.
+These commands interrupt any job still running; they do not wait for it.
+Restarting loads the scripts currently on disk, including image-selection
+changes. No bootstrap or image rebuild is needed.
+
+Restart one loaded daemon (runner 1):
+
+```bash
+sudo launchctl bootout system/com.github.tart-runner-1 &&
+  sudo launchctl bootstrap system /Library/LaunchDaemons/com.github.tart-runner-1.plist
+```
+
+If the service is already stopped, run only the `bootstrap` command. After it
+starts, use [Check Whether Updates Worked](#check-whether-updates-worked) to
+confirm the selected image, startup runner version and a successful job.
 
 Daemons (example: three runners):
 
