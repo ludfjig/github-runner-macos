@@ -317,6 +317,8 @@ These register as separate runners. You can use them alongside the macOS runners
 
 - `bootstrap-tart-runners.sh`: prepares the image if needed; with `--install-launchd`, installs runner services and the daily image updater.
 - `tart-install-image-updater.sh`: installs daily image updates without changing runner services.
+- `tart-configure-runners.sh`: changes RAM for existing runner services 1 through N,
+  restarts them, and installs the daily image updater with a separate 4 GiB budget.
 - `tart-update-image.sh`: updates Ubuntu packages and the GitHub runner in a verified image clone.
 - `tart-bake-ubuntu.sh`: prepares the Ubuntu 24.04 image with the runner and KVM support.
 - `tart-runner-loop.sh`: repeatedly creates a VM, runs one job and deletes the VM.
@@ -493,6 +495,31 @@ VM during the update. Superseded images are cleaned up automatically as describe
 below.
 
 ### Job And Maintenance VM Memory
+
+For existing system runner services, set a runner count and RAM **per runner in
+GiB** with one command:
+
+```bash
+# Runner 1: 8 GiB, plus the daily image-update service at 4 GiB.
+sudo bash tart-configure-runners.sh 1 8
+
+# Runners 1 and 2: 8 GiB each, on a host with enough RAM for both.
+# sudo bash tart-configure-runners.sh 2 8
+```
+
+This updates `com.github.tart-runner-1` through the requested count and restarts
+them, interrupting running jobs. It checks every target before changing any:
+services must already be installed and loaded as system LaunchDaemons, point to
+this checkout, and share the same Tart owner, image and connection settings.
+Services outside the requested range are untouched. It does not create missing
+runner services or provision a fresh machine; use First Install for that.
+
+The script rejects a selected runner budget plus the updater's 4 GiB when that
+would leave no RAM for macOS. This check does not account for other applications
+or runners outside the selected range. On this 16 GiB Mac, use one 8 GiB runner.
+Service changes are sequential: if a restart fails, the command exits non-zero
+and earlier services may already have changed. Fix the reported error before
+retrying.
 
 Job VMs use **8192 MiB (8 GiB)** by default. The loop applies this allocation to
 each disposable clone before boot, including clones of existing images and LKG
