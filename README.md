@@ -1106,6 +1106,16 @@ registration afterward. You normally do not need to remove it in GitHub.
   read/search access to those directories and read access to report files,
   including future reports. Collection errors do not stop VM cleanup.
 
+  Daemon service installation sets the host-wide type `309` crash-report limit
+  to 1,000 to avoid the default 25-report cap. It uses the undocumented
+  `309_CountLimit` preference in `com.apple.osanalytics`, identified on
+  macOS 26.5.2. Verify report creation after deployment. For agent services,
+  an administrator can apply it:
+
+  ```bash
+  sudo defaults write /Library/Preferences/com.apple.osanalytics 309_CountLimit -int 1000
+  ```
+
   With `TART_KEEP_FAILED_VM=1`, failed clones are not deleted, so you can inspect their state with `tart list` and `tart get <vm-name>`.
 
 - **`/dev/kvm` missing / bake fails at `kvm-ok`:** the host isn't M3/M4 on

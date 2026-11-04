@@ -186,7 +186,7 @@ PLIST
 esac
 MOCK
 chmod +x "$TEST_ROOT/bin/mock"
-for command_name in curl tart ssh pkill openssl dscl id chown stat plutil launchctl apt-get apt-mark dpkg-query; do
+for command_name in curl tart ssh pkill openssl dscl id chown stat plutil launchctl defaults apt-get apt-mark dpkg-query; do
     ln -s mock "$TEST_ROOT/bin/$command_name"
 done
 
@@ -435,6 +435,7 @@ echo 'PASS: explicit 03:00 local scheduling has no run-at-load or interval and r
 : >"$TEST_LOG"
 bash "$SCRIPT_DIR/bootstrap-tart-runners.sh" --count 1 --org example \
     --app-id 123 --private-key "$TEST_ROOT/app.pem" --install-launchd
+if grep -Fq 'defaults ' "$TEST_LOG"; then exit 1; fi
 assert_contains "$TEST_LOG" '<StartInterval> <-integer> <86400>'
 assert_contains "$TEST_LOG" '<RunAtLoad> <-bool> <YES>'
 assert_contains "$TEST_LOG" 'tart-update-image.sh'
@@ -447,6 +448,7 @@ bash "$SCRIPT_DIR/bootstrap-tart-runners.sh" --count 1 --org example \
     --app-id 123 --private-key "$TEST_ROOT/app.pem" --install-launchd \
     --launchd-scope daemon --launchd-user test-user --launchd-dir "$TEST_ROOT/daemons" \
     --memory-mb 6144
+assert_contains "$TEST_LOG" 'defaults <write> </Library/Preferences/com.apple.osanalytics> <309_CountLimit> <-int> <1000>'
 assert_contains "$TEST_LOG" '<UserName> <-string> <test-user>'
 assert_contains "$TEST_LOG" "launchctl <bootstrap> <system> <$TEST_ROOT/daemons/com.github.tart-runner-image-refresh.plist>"
 python3 - "$TEST_ROOT/daemons/com.github.tart-runner-1.plist" <<'PLIST'
@@ -456,6 +458,13 @@ with open(sys.argv[1], "rb") as stream:
     assert plistlib.load(stream)["EnvironmentVariables"]["TART_GUEST_MEMORY_MB"] == "6144"
 PLIST
 echo 'PASS: daemon scheduler runs under the runner account'
+
+: >"$TEST_LOG"
+bash "$SCRIPT_DIR/bootstrap-tart-runners.sh" --count 1 --org example \
+    --app-id 123 --private-key "$TEST_ROOT/app.pem" \
+    --launchd-scope daemon --launchd-user test-user
+if grep -Fq 'defaults ' "$TEST_LOG"; then exit 1; fi
+echo 'PASS: image-only daemon bootstrap leaves host crash-report settings unchanged'
 
 : >"$TEST_LOG"
 bash "$SCRIPT_DIR/bootstrap-tart-runners.sh" --count 1 --org example \

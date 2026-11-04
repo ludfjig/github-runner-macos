@@ -361,6 +361,11 @@ log "Guest sizing: cpu=${TART_GUEST_CPUS}, mem=${TART_GUEST_MEMORY_MB}MB, disk=$
 log "launchd: scope=${LAUNCHD_SCOPE}, dir=${LAUNCHD_DIR}, user=${LAUNCHD_USER}"
 log "launchd debug: TART_RUNNER_DEBUG=${RUNNER_DEBUG_MODE}, TART_KEEP_FAILED_VM=${KEEP_FAILED_VM_MODE}, TART_VM_LOG_LOOKBACK_MINUTES=${VM_LOG_LOOKBACK_MINUTES}"
 
+if [ "$INSTALL_LAUNCHD" = true ] && [ "$LAUNCHD_SCOPE" = "daemon" ]; then
+    defaults write /Library/Preferences/com.apple.osanalytics 309_CountLimit -int 1000
+    log "Host crash report limit set to 1000."
+fi
+
 ensure_golden_image
 
 for i in $(seq 1 "$COUNT"); do
