@@ -1,17 +1,17 @@
 default: check
 
 format:
-    shfmt -w -i 4 -ci tart-install-image-updater.sh tart-update-image.sh tart-configure-runners.sh tart-guest-memory.sh tests/tart-image-refresh.test.sh tests/tart-configure-runners.test.sh tests/tart-guest-memory.test.sh
+    shfmt -w -i 4 -ci tart-install-image-updater.sh tart-update-image.sh tart-configure-runners.sh tart-guest-memory.sh tests/tart-image-refresh.test.sh tests/tart-configure-runners.test.sh tests/tart-guest-memory.test.sh tests/tart-vm-diagnostics.test.sh
 
 format-check:
-    shfmt -d -i 4 -ci tart-install-image-updater.sh tart-update-image.sh tart-configure-runners.sh tart-guest-memory.sh tests/tart-image-refresh.test.sh tests/tart-configure-runners.test.sh tests/tart-guest-memory.test.sh
+    shfmt -d -i 4 -ci tart-install-image-updater.sh tart-update-image.sh tart-configure-runners.sh tart-guest-memory.sh tests/tart-image-refresh.test.sh tests/tart-configure-runners.test.sh tests/tart-guest-memory.test.sh tests/tart-vm-diagnostics.test.sh
     git diff --check
 
 syntax:
-    for file in bootstrap-tart-runners.sh tart-common.sh tart-runner-loop.sh tart-bake-ubuntu.sh tart-install-image-updater.sh tart-update-image.sh tart-configure-runners.sh tart-guest-memory.sh tests/tart-image-refresh.test.sh tests/tart-configure-runners.test.sh tests/tart-guest-memory.test.sh tests/tart-image-retention.test.sh; do bash -n "$file" || exit; done
+    for file in bootstrap-tart-runners.sh tart-common.sh tart-runner-loop.sh tart-bake-ubuntu.sh tart-install-image-updater.sh tart-update-image.sh tart-configure-runners.sh tart-guest-memory.sh tests/tart-image-refresh.test.sh tests/tart-configure-runners.test.sh tests/tart-guest-memory.test.sh tests/tart-image-retention.test.sh tests/tart-vm-diagnostics.test.sh; do bash -n "$file" || exit; done
 
 lint:
-    shellcheck -S warning bootstrap-tart-runners.sh tart-runner-loop.sh tart-bake-ubuntu.sh tart-install-image-updater.sh tart-update-image.sh tart-configure-runners.sh tart-guest-memory.sh tests/tart-image-refresh.test.sh tests/tart-configure-runners.test.sh tests/tart-guest-memory.test.sh tests/tart-image-retention.test.sh
+    shellcheck -S warning bootstrap-tart-runners.sh tart-runner-loop.sh tart-bake-ubuntu.sh tart-install-image-updater.sh tart-update-image.sh tart-configure-runners.sh tart-guest-memory.sh tests/tart-image-refresh.test.sh tests/tart-configure-runners.test.sh tests/tart-guest-memory.test.sh tests/tart-image-retention.test.sh tests/tart-vm-diagnostics.test.sh
     shellcheck -S warning -e SC2064 tart-common.sh
 
 test-image-refresh:
@@ -23,5 +23,6 @@ test:
     bash tests/tart-configure-runners.test.sh
     bash tests/tart-guest-memory.test.sh
     bash tests/tart-image-retention.test.sh
+    bash tests/tart-vm-diagnostics.test.sh
 
 check: format-check syntax lint test

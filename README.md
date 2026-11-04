@@ -1098,8 +1098,25 @@ registration afterward. You normally do not need to remove it in GitHub.
   Then inspect:
   - `~/.github-runner-logs/tart-runner-<n>-stdout.log` (runner activity)
   - `~/.github-runner-logs/tart-runner-<n>-vm-*.log` (raw `tart run` output, includes VZ errors)
-  - `~/.github-runner-logs/tart-runner-<n>-vm-diagnostics.log` (host `log show` extract for Tart/Virtualization)
+  - `~/.github-runner-logs/tart-runner-<n>-vm-diagnostics.log` (collection summary and bundle paths)
   - `~/.github-runner-logs/tart-runner-<n>-trace.log` (shell commands run with debug logging enabled)
+
+  Each failed iteration saves a `tart-runner-<n>-vm-diagnostics.*` directory
+  under the log directory. It contains the full filtered system log, available
+  Tart and runner output, and complete crash reports from the system and user
+  DiagnosticReports directories. Collection covers the iteration from VM
+  startup. Virtualization reports with a different runner coalition are skipped.
+  Reports with an unknown coalition are saved as candidates.
+
+  The diagnostics log records missing directories and collection errors.
+  `system.log` includes `ReportCrash` events, which can explain a missing report
+  when macOS reports `Log limit exceeded`. Collection failures do not stop VM
+  cleanup or failure tracking.
+
+  The service account needs read/search access to the system report directory
+  and read access to its report files. An administrator must grant this access,
+  including access to future reports. Permission errors appear in the
+  diagnostics log.
 
   With `TART_KEEP_FAILED_VM=1`, failed clones are not deleted, so you can inspect their state with `tart list` and `tart get <vm-name>`.
 

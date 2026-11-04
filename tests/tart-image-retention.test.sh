@@ -269,7 +269,10 @@ echo 'PASS: only a real Succeeded job result counts, including CRLF runner outpu
 mkdir "$TEST_ROOT/source"
 cp "$SCRIPT_DIR/tart-common.sh" "$SCRIPT_DIR/tart-guest-memory.sh" "$TEST_ROOT/source/"
 cat >> "$TEST_ROOT/source/tart-common.sh" <<'DIAGNOSTICS'
-capture_host_vm_diagnostics() { echo 'fixture VM diagnostics' >&2; }
+capture_host_vm_diagnostics() {
+    echo 'fixture VM diagnostics' >&2
+    [ "${TEST_DIAGNOSTICS_FAIL:-0}" = 0 ]
+}
 DIAGNOSTICS
 sed -e 's/^while true; do$/for _test_iteration in 1; do/' \
     -e 's/^        sleep 10$/        :/' "$SCRIPT_DIR/tart-runner-loop.sh" \
@@ -372,3 +375,14 @@ exists "$base-runner-1"
 assert_contains "$TEST_ROOT/loop-output" 'Keeping failed VM clone for inspection'
 [ -z "$(find "$TART_DEBUG_LOG_DIR" -name '*-job-output.*' -print)" ]
 echo 'PASS: failed SSH never certifies a job and retained diagnostic clones keep their source leases'
+
+reset_case
+export TEST_DIAGNOSTICS_FAIL=1 TEST_SSH_EXIT=1 TART_KEEP_FAILED_VM=0
+bash "$TEST_ROOT/source/tart-runner-loop.sh" --app-id 123 --private-key "$TEST_ROOT/app.pem" \
+    --repo owner/repo > "$TEST_ROOT/loop-output" 2>&1 || { cat "$TEST_ROOT/loop-output"; exit 1; }
+assert_contains "$TEST_ROOT/loop-output" 'Host VM diagnostic collection failed'
+assert_contains "$TEST_ROOT/loop-output" 'Failure reason: remote runner command exited non-zero'
+[ ! -f "$state/$base.in-use/$base-runner-1" ]
+! exists "$base-runner-1"
+[ -s "$TART_CONFIG_DIR/runner-1.failure-epochs" ]
+echo 'PASS: diagnostic failure does not interrupt clone cleanup or failure tracking'
