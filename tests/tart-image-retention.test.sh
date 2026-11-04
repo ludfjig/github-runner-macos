@@ -266,6 +266,34 @@ printf 'Job finished; tearing down clone\nUpdate finished successfully.\n' > "$T
 ! runner_job_succeeded "$TEST_ROOT/job-output"
 echo 'PASS: only a real Succeeded job result counts, including CRLF runner output'
 
+(
+    set -E
+    export HOME="$TEST_ROOT/missing-home"
+    cat > "$TEST_ROOT/bin/log" <<'LOG'
+#!/bin/bash
+echo "system log fixture: $*"
+LOG
+    chmod +x "$TEST_ROOT/bin/log"
+    sed "s|\"/Library/Logs/DiagnosticReports\"|\"$TEST_ROOT/system-reports\"|" \
+        "$SCRIPT_DIR/tart-common.sh" > "$TEST_ROOT/diagnostics-common.sh"
+    source "$TEST_ROOT/diagnostics-common.sh"
+    install_err_diagnostics fixture
+    capture_host_vm_diagnostics tart-runner-1 fixture-vm
+    diag_log="$TART_DEBUG_LOG_DIR/tart-runner-1-vm-diagnostics.log"
+    assert_contains "$diag_log" 'system log fixture: show'
+    assert_contains "$diag_log" 'ReportCrash'
+    echo 'PASS: missing report directories allow system log collection'
+
+    mkdir "$TEST_ROOT/system-reports"
+    report="$TEST_ROOT/system-reports/com.apple.Virtualization.VirtualMachine-fixture.ips"
+    printf '%s\n' report-start {1..130} report-end > "$report"
+    capture_host_vm_diagnostics tart-runner-1 fixture-vm
+    assert_contains "$diag_log" "$report"
+    assert_contains "$diag_log" report-start
+    assert_contains "$diag_log" report-end
+    echo 'PASS: system crash reports are collected in full with a missing user directory'
+)
+
 mkdir "$TEST_ROOT/source"
 cp "$SCRIPT_DIR/tart-common.sh" "$SCRIPT_DIR/tart-guest-memory.sh" "$TEST_ROOT/source/"
 cat >> "$TEST_ROOT/source/tart-common.sh" <<'DIAGNOSTICS'

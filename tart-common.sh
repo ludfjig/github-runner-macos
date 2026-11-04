@@ -350,97 +350,48 @@ install_err_diagnostics() {
 capture_host_vm_diagnostics() {
     local runner_label="$1"
     local vm_name="$2"
-    local vm_runtime_log="${3:-}"
-    local runner_output="${4:-}"
-    local diag_dir started_at scope report_dir report_dest report coalition
-    local log_window=(--last "${TART_VM_LOG_LOOKBACK_MINUTES}m")
-    local report_window=(-mmin "-${TART_VM_LOG_LOOKBACK_MINUTES}")
+    local report_dir latest_vm_report
 
     mkdir -p "$TART_DEBUG_LOG_DIR" || return 1
     local diag_file="${TART_DEBUG_LOG_DIR}/${runner_label}-vm-diagnostics.log"
-    diag_dir="$(mktemp -d "${TART_DEBUG_LOG_DIR}/${runner_label}-vm-diagnostics.XXXXXX")" || return 1
-    if [ -n "$vm_runtime_log" ] && [ -f "${vm_runtime_log}.started" ]; then
-        if IFS= read -r started_at < "${vm_runtime_log}.started" && [ -n "$started_at" ]; then
-            log_window=(--start "$started_at")
-            report_window=(-newer "${vm_runtime_log}.started")
-        else
-            err "[${runner_label}] Could not read iteration start; using the configured lookback"
-        fi
-    fi
 
     {
         echo ""
         echo "========== $(date '+%Y-%m-%d %H:%M:%S') =========="
         echo "runner=${runner_label} vm=${vm_name}"
-        echo "bundle=${diag_dir}"
         echo "macOS=$(sw_vers -productVersion 2>/dev/null || true) build=$(sw_vers -buildVersion 2>/dev/null || true)"
         echo "kernel=$(uname -a 2>/dev/null || true)"
         echo ""
         echo "-- tart list --"
-        tart list || echo "Could not list Tart VMs."
+        tart list 2>/dev/null || true
         echo ""
         echo "-- recent system log (Virtualization + tart) --"
-        if ! command log show --style compact "${log_window[@]}" \
+        command log show --style compact --last "${TART_VM_LOG_LOOKBACK_MINUTES}m" \
             --predicate '(process == "tart") || (process == "ReportCrash") || (subsystem BEGINSWITH "com.apple.Virtualization") || (senderImagePath CONTAINS[c] "Virtualization")' \
-            > "$diag_dir/system.log" 2>&1; then
-            echo "Could not read the system log. See ${diag_dir}/system.log."
-        fi
-        echo "System log: ${diag_dir}/system.log"
+            2>&1 | tail -n 300 || true
 
-        echo ""
-        echo "-- recent DiagnosticReports (tart/virtualization) --"
-        for scope in system user; do
-            if [ "$scope" = system ]; then
-                report_dir="/Library/Logs/DiagnosticReports"
+        for report_dir in "/Library/Logs/DiagnosticReports" "$HOME/Library/Logs/DiagnosticReports"; do
+            [ -d "$report_dir" ] || continue
+            echo ""
+            echo "-- recent DiagnosticReports: ${report_dir} --"
+            find "$report_dir" -maxdepth 1 -type f \
+                \( -name 'tart*.crash' -o -name 'tart*.ips' -o -name '*Virtualization*.crash' -o -name '*Virtualization*.ips' -o -name 'kernel*.panic' -o -name 'kernel*.ips' \) \
+                -print | tail -n 6 || true
+
+            echo ""
+            echo "-- latest available Virtualization crash report (candidate) --"
+            latest_vm_report="$(find "$report_dir" -maxdepth 1 -type f -name 'com.apple.Virtualization.VirtualMachine-*.ips' | sort | tail -n 1)" || latest_vm_report=""
+            if [ -n "$latest_vm_report" ] && [ -f "$latest_vm_report" ]; then
+                echo "$latest_vm_report"
+                cat "$latest_vm_report" || true
             else
-                report_dir="$HOME/Library/Logs/DiagnosticReports"
+                echo "none"
             fi
-            if [ ! -d "$report_dir" ]; then
-                echo "Report directory missing: ${report_dir}"
-                continue
-            fi
-            report_dest="$diag_dir/$scope"
-            if ! mkdir "$report_dest"; then
-                echo "Could not create report destination: ${report_dest}"
-                continue
-            fi
-            while IFS= read -r -d '' report; do
-                case "$report" in
-                    */com.apple.Virtualization.VirtualMachine-*.ips)
-                        if coalition="$(jq -r '.coalitionName // empty' "$report")"; then
-                            if [ -n "$coalition" ] && [ "$coalition" != "com.github.${runner_label}" ]; then
-                                echo "Report belongs to another coalition: ${report} (${coalition})"
-                                continue
-                            fi
-                        else
-                            echo "Could not read report coalition. Saving candidate: ${report}"
-                        fi
-                        ;;
-                esac
-                if cp "$report" "$report_dest/"; then
-                    echo "Saved report: ${report_dest}/${report##*/}"
-                else
-                    echo "Could not copy report: ${report}"
-                fi
-            done < <(
-                find "$report_dir" -maxdepth 1 -type f "${report_window[@]}" \
-                    \( -name 'tart*.crash' -o -name 'tart*.ips' -o -name '*Virtualization*.crash' -o -name '*Virtualization*.ips' -o -name 'kernel*.panic' -o -name 'kernel*.ips' \) \
-                    -print0 || err "Could not finish searching reports: ${report_dir}"
-            )
         done
-        if [ -n "$vm_runtime_log" ] && [ -f "$vm_runtime_log" ]; then
-            cp "$vm_runtime_log" "$diag_dir/tart.log" || echo "Could not copy Tart log: ${vm_runtime_log}"
-        fi
-        if [ -n "$runner_output" ] && [ -f "$runner_output" ]; then
-            cp "$runner_output" "$diag_dir/runner.log" || echo "Could not copy runner log: ${runner_output}"
-        fi
         echo "-- end diagnostics --"
-    } >> "$diag_file" 2>&1 || {
-        err "[${runner_label}] Could not write host VM diagnostics: ${diag_file}"
-        return 1
-    }
+    } >> "$diag_file" 2>&1 || return 1
 
-    err "[${runner_label}] Host VM diagnostics appended to ${diag_file}; bundle: ${diag_dir}"
+    err "[${runner_label}] Host VM diagnostics appended to ${diag_file}"
 }
 
 # -----------------------------------------------------------------------------
